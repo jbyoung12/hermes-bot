@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjbyoung12%2Fhermes-bot%2Fmain%2FCargo.toml&query=%24.package%5B%22rust-version%22%5D&label=rust&suffix=%2B&color=blue)](https://www.rust-lang.org)
 
-**Control Claude Code from Slack.** Each channel is a repo, each thread is a session.
+**Control Claude Code from Slack.** Each channel is a repo, each Slack thread is a session.
 
 Access Claude from anywhere — start on your laptop, continue on your phone. Sessions persist across messages and restarts, local CLI sessions auto-sync to Slack, and fine-grained tool permissions control what Claude can run. Zero infrastructure needed (Socket Mode, no webhooks).
 
@@ -26,7 +26,7 @@ In Slack, type in a repo channel:
 fix the failing tests in the auth module
 ```
 
-Hermes replies in a thread. Reply to continue — full history is preserved.
+Hermes replies in a Slack thread. Reply to continue — full history is preserved.
 
 ## Features
 
@@ -36,7 +36,7 @@ Hermes replies in a thread. Reply to continue — full history is preserved.
 - 🔒 **Fine-grained permissions** — Control which tools Claude can use per repo
 - 👥 **Team-friendly** — Deploy on a VPS for shared access
 - ⚡ **Zero infrastructure** — Socket Mode (no webhooks, no public URLs)
-- 🧵 **Thread-based** — One channel = one repo, one thread = one session
+- 🧵 **Thread-based** — One channel = one repo, one Slack thread = one session
 
 ## How It Works
 
@@ -53,10 +53,10 @@ Hermes replies in a thread. Reply to continue — full history is preserved.
      │                              │                                 │
      │                              │  3. Stream events (tools, text) │
      │                              │◄────────────────────────────────┤
-     │  4. Post results in thread   │                                 │
+     │  4. Post results in Slack thread                               │
      │◄─────────────────────────────┤                                 │
      │                              │                                 │
-     │  5. User replies in thread   │                                 ▼
+     │  5. User replies in Slack thread                               ▼
      ├──────────────────────────────►                           ┌──────────┐
      │                              │  6. Resume session        │ Local    │
      │                              ├──────────────────────────►│ Git Repo │
@@ -153,7 +153,7 @@ Local session detected (branch: main)
 > fix the tests
 ```
 
-Reply in the thread to continue from Slack.
+Reply in the Slack thread to continue.
 
 ### Security & Permissions
 
@@ -180,7 +180,7 @@ Example: `frontend` repo allows `Bash(npm *)` but not `Bash(rm *)`.
 | Feature            | Hermes                                   | OpenClaw / Alternatives                 |
 | ------------------ | ---------------------------------------- | --------------------------------------- |
 | **Infrastructure** | Socket Mode — laptop or VPS, no webhooks | Requires public URLs, server deployment |
-| **Mental model**   | Channel = repo, thread = session         | Varies                                  |
+| **Mental model**   | Channel = repo, Slack thread = session   | Varies                                  |
 | **Implementation** | Uses Claude CLI — gets updates free      | Often reimplements integration          |
 | **Local + Remote** | Auto-syncs local sessions                | Typically Slack-only or CLI-only        |
 | **Security**       | Per-repo tool permissions                | Often all-or-nothing                    |
@@ -210,7 +210,7 @@ Example: `frontend` repo allows `Bash(npm *)` but not `Bash(rm *)`.
 - **Socket Mode** — No public URL, works on laptop or VPS
 - **Agent trait** — Extensible backend (Claude Code implemented)
 - **Session persistence** — `sessions.json` survives restarts
-- **Concurrency guard** — One agent per thread
+- **Concurrency guard** — One agent per Slack thread
 - **Local session sync** — Filesystem watcher imports CLI sessions
 
 ```
