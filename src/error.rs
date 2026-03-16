@@ -12,7 +12,9 @@ pub enum HermesError {
     SessionNotFound(String),
 
     /// Claude CLI binary not found in PATH
-    #[error("Claude CLI not found in PATH. Install it from: https://docs.anthropic.com/en/docs/claude-code")]
+    #[error(
+        "Claude CLI not found in PATH. Install it from: https://docs.anthropic.com/en/docs/claude-code"
+    )]
     ClaudeNotFound,
 
     /// Failed to spawn the Claude CLI process

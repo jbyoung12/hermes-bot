@@ -7,7 +7,7 @@ use crate::config::{AgentKind, Config};
 use slack_morphism::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -144,10 +144,10 @@ impl AppState {
 
     /// Resolve the model for a thread: thread override > repo config > global default.
     pub async fn resolved_model(&self, repo_name: &str, thread_ts: Option<&str>) -> String {
-        if let Some(ts) = thread_ts {
-            if let Some(m) = self.thread_models.lock().await.get(ts) {
-                return m.clone();
-            }
+        if let Some(ts) = thread_ts
+            && let Some(m) = self.thread_models.lock().await.get(ts)
+        {
+            return m.clone();
         }
         match self.config.repos.get(repo_name) {
             Some(repo) => repo.resolved_model(&self.config.defaults),

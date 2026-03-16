@@ -265,14 +265,14 @@ impl Config {
             }
 
             // Security: Warn about relative paths with .. (path traversal risk)
-            if let Some(path_str) = repo.path.to_str() {
-                if path_str.contains("..") {
-                    tracing::warn!(
-                        "Repo '{}' path contains '..': {}. Verify this is intentional.",
-                        name,
-                        path_str
-                    );
-                }
+            if let Some(path_str) = repo.path.to_str()
+                && path_str.contains("..")
+            {
+                tracing::warn!(
+                    "Repo '{}' path contains '..': {}. Verify this is intentional.",
+                    name,
+                    path_str
+                );
             }
         }
 
@@ -451,10 +451,12 @@ bot_token = "xoxb-test"
         let config: Config = toml::from_str(toml).unwrap();
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No repos configured"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No repos configured")
+        );
     }
 
     #[test]

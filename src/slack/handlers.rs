@@ -5,12 +5,12 @@ use chrono::Utc;
 use slack_morphism::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use super::api::*;
-use super::formatting::{self, format_questions, split_for_slack, truncate_text, AgentResponse};
+use super::formatting::{self, AgentResponse, format_questions, split_for_slack, truncate_text};
 use super::{AppState, FALLBACK_TITLE_MAX_LEN, SLACK_MAX_MESSAGE_CHARS, SLACK_UPDATE_MAX_CHARS};
 
 // All magic numbers are now configurable via config.tuning.
@@ -199,9 +199,7 @@ pub(crate) async fn handle_event_result(
 
                 // If the response is a single chunk that fits in the update
                 // limit and we have a placeholder message, edit it in place.
-                if chunks.len() == 1
-                    && chunks[0].len() <= SLACK_UPDATE_MAX_CHARS
-                {
+                if chunks.len() == 1 && chunks[0].len() <= SLACK_UPDATE_MAX_CHARS {
                     if let Some(ref ts) = config.status_ts {
                         update_message(state, channel_id, ts, &chunks[0]).await;
                         posted = true;
@@ -914,47 +912,38 @@ pub(crate) async fn process_events(
                 ref input,
             } => {
                 // Surface plan files written to ~/.claude/plans/ so they're visible in Slack.
-                if name == "Write" {
-                    if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
-                        if path.contains(".claude/plans/") {
-                            if let Some(content) = input.get("content").and_then(|v| v.as_str()) {
-                                // Validate plan size before processing.
-                                let max_size = state.config.tuning.max_accumulated_text_bytes;
-                                if let Err(e) = validate_plan_size(content, max_size) {
-                                    warn!("Plan validation failed: {}", e);
-                                    post_thread_reply(
-                                        state,
-                                        channel_id,
-                                        thread_ts,
-                                        &format!("⚠️ {}", e),
-                                    )
-                                    .await;
-                                } else {
-                                    let formatted_content =
-                                        crate::slack::formatting::markdown_to_slack(content);
-                                    let plan_msg = format!("*Plan*\n\n{}", formatted_content);
-                                    post_thread_reply(state, channel_id, thread_ts, &plan_msg)
-                                        .await;
+                if name == "Write"
+                    && let Some(path) = input.get("file_path").and_then(|v| v.as_str())
+                    && path.contains(".claude/plans/")
+                    && let Some(content) = input.get("content").and_then(|v| v.as_str())
+                {
+                    // Validate plan size before processing.
+                    let max_size = state.config.tuning.max_accumulated_text_bytes;
+                    if let Err(e) = validate_plan_size(content, max_size) {
+                        warn!("Plan validation failed: {}", e);
+                        post_thread_reply(state, channel_id, thread_ts, &format!("⚠️ {}", e)).await;
+                    } else {
+                        let formatted_content =
+                            crate::slack::formatting::markdown_to_slack(content);
+                        let plan_msg = format!("*Plan*\n\n{}", formatted_content);
+                        post_thread_reply(state, channel_id, thread_ts, &plan_msg).await;
 
-                                    // Store plan content for !execute command.
-                                    state
-                                        .last_plan
-                                        .lock()
-                                        .await
-                                        .insert(thread_ts.to_string(), content.to_string());
+                        // Store plan content for !execute command.
+                        state
+                            .last_plan
+                            .lock()
+                            .await
+                            .insert(thread_ts.to_string(), content.to_string());
 
-                                    post_thread_reply(
-                                        state,
-                                        channel_id,
-                                        thread_ts,
-                                        "_Reply `/execute` to run this plan with a fresh context window._",
-                                    )
-                                    .await;
+                        post_thread_reply(
+                            state,
+                            channel_id,
+                            thread_ts,
+                            "_Reply `/execute` to run this plan with a fresh context window._",
+                        )
+                        .await;
 
-                                    plan_posted = true;
-                                }
-                            }
-                        }
+                        plan_posted = true;
                     }
                 }
 
@@ -1285,10 +1274,10 @@ async fn handle_execute_plan(
     };
 
     // Kill existing agent if running.
-    if let Some(mut handle) = state.agent_handles.lock().await.remove(&thread_ts) {
-        if let Some(kill_tx) = handle.kill_tx.take() {
-            let _ = kill_tx.send(());
-        }
+    if let Some(mut handle) = state.agent_handles.lock().await.remove(&thread_ts)
+        && let Some(kill_tx) = handle.kill_tx.take()
+    {
+        let _ = kill_tx.send(());
     }
 
     // Concurrency guard.

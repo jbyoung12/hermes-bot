@@ -41,7 +41,6 @@ tests/
 
 ## Code Conventions
 
-- Rust 2021 edition, MSRV 1.80
 - Async runtime: tokio (multi-threaded)
 - Error handling: `thiserror` for error types, `Box<dyn Error>` at the top level
 - Logging: `tracing` with `tracing-subscriber` (env-filter, default level `info`)

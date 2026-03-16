@@ -6,8 +6,8 @@ mod slack;
 mod sync;
 mod util;
 
-use crate::agent::claude::ClaudeAgent;
 use crate::agent::Agent;
+use crate::agent::claude::ClaudeAgent;
 use crate::config::AgentKind;
 use crate::session::SessionStore;
 use crate::slack::AppState;

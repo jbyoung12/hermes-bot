@@ -228,10 +228,10 @@ pub(crate) fn format_agent_response(resp: &AgentResponse) -> Vec<String> {
 
     let mut chunks = split_for_slack(&text, SLACK_MAX_MESSAGE_CHARS);
     // Add error prefix to first chunk.
-    if !prefix.is_empty() {
-        if let Some(first) = chunks.first_mut() {
-            *first = format!("{}{}", prefix, first);
-        }
+    if !prefix.is_empty()
+        && let Some(first) = chunks.first_mut()
+    {
+        *first = format!("{}{}", prefix, first);
     }
     // Append footer to the last chunk.
     if let Some(last) = chunks.last_mut() {

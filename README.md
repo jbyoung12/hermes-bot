@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jbyoung12/hermes-bot/workflows/CI/badge.svg)](https://github.com/jbyoung12/hermes-bot/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust Version](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjbyoung12%2Fhermes-bot%2Fmain%2FCargo.toml&query=%24.package%5B%22rust-version%22%5D&label=rust&suffix=%2B&color=blue)](https://www.rust-lang.org)
 
 **Control Claude Code from Slack.** Each channel is a repo, each thread is a session.
 
@@ -68,7 +68,7 @@ Hermes replies in a thread. Reply to continue — full history is preserved.
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) 1.80+
+- [Rust](https://rustup.rs/) (see `rust-version` in `Cargo.toml` for MSRV)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
 - A Slack workspace where you can create apps
 
@@ -245,7 +245,6 @@ cargo test
 
 **Guidelines:**
 
-- Rust 2021, MSRV 1.80
 - Use `thiserror` for errors
 - Add tests for new features
 - Keep commits focused

@@ -31,10 +31,10 @@ impl ClaudeAgent {
         }
 
         // Only pass --model for new sessions; the CLI remembers for --resume.
-        if resume_session_id.is_none() {
-            if let Some(m) = model {
-                cmd.arg("--model").arg(m);
-            }
+        if resume_session_id.is_none()
+            && let Some(m) = model
+        {
+            cmd.arg("--model").arg(m);
         }
 
         for tool in allowed_tools {
