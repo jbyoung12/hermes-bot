@@ -1,0 +1,45 @@
+[package]
+name = "hermes-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Remote Claude Code control via Slack — each channel is a repo, each thread is a session"
+license = "MIT"
+repository = "https://github.com/jbyoung12/hermes-bot"
+homepage = "https://github.com/jbyoung12/hermes-bot"
+readme = "README.md"
+keywords = ["slack", "claude", "ai", "cli", "automation"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".github/",
+    ".env.example",
+    "config.toml.example",
+    "slack-manifest.json",
+]
+
+[lib]
+name = "hermes_bot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+slack-morphism = { version = "2.18", features = ["hyper"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "process", "time", "fs", "signal"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+notify = "8"
+regex = "1"
+
+[dev-dependencies]
+rstest = "0.18"
+rand = "0.8"

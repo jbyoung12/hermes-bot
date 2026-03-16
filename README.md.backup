@@ -1,0 +1,504 @@
+# Hermes
+
+[![CI](https://github.com/jbyoung12/hermes-bot/workflows/CI/badge.svg)](https://github.com/jbyoung12/hermes-bot/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust Version](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
+
+Remote Claude Code control via Slack. Each channel is a repo, each thread is a session.
+
+## How it works
+
+```
+┌─────────┐                    ┌─────────┐                    ┌─────────────┐
+│  Slack  │ ◄─── Socket Mode──►│ Hermes  │ ◄─── stdin/out ───►│ Claude CLI  │
+│ Channel │                    │         │                    │   Process   │
+└─────────┘                    └─────────┘                    └──────┬──────┘
+     │                              │                                 │
+     │  1. User types message       │                                 │
+     ├──────────────────────────────►                                 │
+     │                              │  2. Spawn agent                 │
+     │                              ├─────────────────────────────────►
+     │                              │                                 │
+     │                              │  3. Stream events (tools, text) │
+     │                              │◄────────────────────────────────┤
+     │  4. Post results in thread   │                                 │
+     │◄─────────────────────────────┤                                 │
+     │                              │                                 │
+     │  5. User replies in thread   │                                 ▼
+     ├──────────────────────────────►                          ┌──────────┐
+     │                              │  6. Resume session        │ Local    │
+     │                              ├──────────────────────────►│ Git Repo │
+     │  7. Continue conversation    │                           └──────────┘
+     │◄─────────────────────────────┘
+```
+
+**Key Features:**
+- Type a message in a repo channel → Hermes starts a new Claude Code session
+- Reply in the thread → Hermes resumes the session with `--resume`
+- Claude's full conversation history is preserved across messages
+- When Claude needs clarification, it asks in the thread — you reply, it continues
+- Sessions persist across Hermes restarts via `sessions.json`
+
+## Why Hermes?
+
+Access Claude Code from anywhere via Slack — start on your laptop, continue on your phone. Sessions persist across messages and restarts, local CLI sessions auto-sync to Slack, and fine-grained tool permissions let you control exactly what Claude can run. Zero infrastructure needed (Socket Mode, no webhooks) — just run it on your laptop, or deploy to a VPS for team use.
+
+## Prerequisites
+
+- [Rust](https://rustup.rs/) (1.80+)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- A Slack workspace where you can create apps
+
+## Slack App Setup
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From an app manifest**
+2. Pick your workspace
+3. Paste the contents of `slack-manifest.json` from this repo
+4. Click **Create**
+5. **Install to Workspace** (OAuth & Permissions → Install to Workspace)
+6. Copy the **Bot Token** (`xoxb-...`) from OAuth & Permissions
+7. Generate an **App Token** (`xapp-...`) from Basic Information → App-Level Tokens → add `connections:write` scope
+8. **Get your Slack User ID** — click your profile in Slack → three dots → **Copy member ID**
+
+## Configuration
+
+**1. Set up Slack tokens** — copy the `.env` template and fill in your tokens:
+
+```bash
+cp .env.example .env
+```
+
+```
+SLACK_APP_TOKEN=xapp-1-...
+SLACK_BOT_TOKEN=xoxb-...
+```
+
+**2. Set up repo config** — copy the example and edit:
+
+```bash
+cp config.toml.example config.toml
+```
+
+See `config.toml.example` for all options. Key sections:
+
+- `[slack]` — tokens (can be left empty if using `.env`) and `allowed_users` (Slack user IDs)
+- `[defaults]` — system prompt, streaming mode, and safe tools (Read, Grep, etc.)
+- `[repos.<name>]` — path, agent type, and repo-specific tools (Edit, Write, Bash, etc.)
+
+Channels are auto-created from repo names on startup (e.g., `repos.my-project` → `#my-project`).
+
+## Usage
+
+```bash
+make run
+```
+
+The Makefile auto-loads `.env`, so you just need `make run`. Alternatively:
+
+```bash
+cargo run
+```
+
+### In Slack
+
+**Start a session** — type in a repo channel:
+```
+fix the failing tests in the auth module
+```
+Hermes replies in a thread with the result.
+
+**Continue the conversation** — reply in the thread:
+```
+now add a test for the edge case where token is exactly at expiry
+```
+
+**Commands in threads:**
+- `!status` — show session info (repo, turns, timestamps)
+- `!stop` — stop the session
+
+**Slash commands:**
+- `/claude sessions` — list active sessions
+- `/claude help` — show help
+
+### How Claude asks questions
+
+When Claude needs clarification, it includes the question in its response text. You reply in the thread, and `--resume` continues the conversation with full history — no special handling needed.
+
+## Team Workflows
+
+**For team use, deploy Hermes on a VPS or shared server.** When Hermes runs on shared infrastructure, multiple people can interact with Claude through Slack.
+
+**Deployment model:**
+- **Personal use (laptop):** You run Hermes on your laptop. You can message Claude from your phone via Slack, but others can't use it when your laptop is off.
+- **Team use (VPS):** You run Hermes on a VPS with shared repos. Anyone in `allowed_users` can message Claude, and it runs on the VPS 24/7.
+
+**How team workflows work (VPS deployment):**
+- **Alice** types in `#backend`: "fix the failing auth tests"
+- Hermes (running on the VPS) replies in a thread with the fix
+- **Bob** sees the thread in the channel and learns how the auth module works
+- **Charlie** replies in the thread: "now add a test for token expiry"
+- Hermes resumes the session with full context and continues
+
+**Key benefits:**
+- **Knowledge sharing** — everyone sees how problems are solved, no siloed conversations
+- **Async collaboration** — team members can jump into threads to ask follow-ups
+- **Audit trail** — all Claude conversations are searchable in Slack
+- **Parallel sessions** — multiple threads can run at once (one active session per thread)
+
+**Important:** Hermes runs **where you deploy it** (your laptop or a VPS). All Claude processes run on that same machine using the repos on that machine. For team use, this means shared infrastructure with shared repo access.
+
+## Security & Tool Permissions
+
+Hermes uses Claude Code's `-p` (pre-approved tools) mode for autonomous operation, but **you control exactly what Claude can do**:
+
+**User allowlist** — Only Slack users in `allowed_users` (config.toml) can interact with Hermes. Everyone else is ignored.
+
+**Tool permissions** — Tools are pre-approved per repo. Claude cannot run a command unless you've explicitly allowed it:
+- **Global** (all repos): `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `Task` — safe, read-only tools
+- **Per-repo**: `Edit`, `Write`, `Bash(cargo *)`, `Bash(npm *)` — risky tools scoped to specific repos
+
+**Example:** Your `frontend` repo might allow `Bash(npm *)` but not `Bash(rm *)`. Your `backend` repo might allow `Bash(cargo *)` but forbid `Write` (read-only exploration).
+
+**Default-deny** — If a tool isn't in `allowed_tools`, Claude cannot use it. Global and per-repo tools are merged at runtime.
+
+**No secrets in config** — Slack tokens live in `.env` (gitignored). `config.toml` can be version-controlled safely (just don't commit tokens).
+
+**Audit trail** — All commands and tool uses are visible in Slack threads. You can see exactly what Claude did.
+
+## Local Session Sync
+
+Hermes automatically detects Claude Code sessions started locally (via the CLI) and imports them into Slack. When you start a session in a configured repo, Hermes posts a message to the repo's channel within seconds:
+
+```
+Local session detected (branch: main)
+> fix the tests
+```
+
+Reply in that thread to continue the session from Slack via `--resume`. Only sessions created after Hermes starts are imported — no retroactive history.
+
+Uses the `notify` crate for filesystem watching (FSEvents on macOS, inotify on Linux).
+
+## How is this different from OpenClaw or other alternatives?
+
+| Feature | Hermes | OpenClaw / Alternatives |
+|---------|--------|------------------------|
+| **Infrastructure** | Socket Mode (WebSocket) — runs on your laptop, no server needed | Requires webhooks, public URLs, server deployment |
+| **Mental model** | One channel = one repo, one thread = one session | Varies by tool |
+| **Implementation** | Uses actual Claude Code CLI — gets updates for free | Often reimplements Claude integration |
+| **Local + Remote** | Auto-syncs local CLI sessions into Slack | Typically Slack-only or CLI-only |
+| **Security** | Fine-grained tool permissions per repo, user allowlist, default-deny | Often all-or-nothing permissions |
+| **Team usage** | Supported with VPS deployment — multiple people can use the same channels | May require workarounds |
+
+Hermes is optimized for simplicity and personal use. Run it on your laptop for mobile access, or deploy to a VPS for team collaboration.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+
+## Troubleshooting
+
+**"Failed to spawn claude CLI" / "Claude CLI not found in PATH"**
+- Ensure `claude` is installed: `npm install -g @anthropic-ai/claude-code`
+- Verify it runs: `claude --version`
+- If installed via a version manager (nvm, fnm), make sure the right Node is active when Hermes starts
+
+**"Socket Mode connection failed" / Hermes exits immediately**
+- Verify `SLACK_APP_TOKEN` starts with `xapp-` and has `connections:write` scope
+- Verify `SLACK_BOT_TOKEN` starts with `xoxb-`
+- Check that Socket Mode is enabled in your Slack app settings (Settings → Socket Mode → Enable)
+
+**"Repo path does not exist"**
+- The path in `[repos.<name>]` must be an absolute path to an existing directory
+- Ensure the user running Hermes has read access to the repo directory
+
+**Bot doesn't respond to messages**
+- Check `allowed_users` in `config.toml` — only listed Slack user IDs can interact with Hermes
+- Verify the bot is a member of the channel (it should auto-join channels it creates)
+- Look for "Ignoring message with subtype" in logs — Hermes only processes regular messages
+
+**"Channel name is reserved by Slack"**
+- A previously deleted channel still holds the name. Set a custom channel name in config:
+  ```toml
+  [repos.my-project]
+  path = "/path/to/repo"
+  channel = "my-project-dev"
+  ```
+
+**Sessions not resuming after Hermes restart**
+- Session data is stored in `sessions.json` (configurable via `sessions_file`). Ensure the file is writable.
+- Agent processes are killed on shutdown — they auto-recover when a user sends the next reply.
+
+## Architecture
+
+- **Socket Mode** — no public URL needed, works on laptop or VPS
+- **Agent trait** — extensible backend design (Claude Code implemented)
+- **Session persistence** — `sessions.json` survives restarts
+- **Concurrency guard** — one agent per thread at a time
+- **Local session sync** — filesystem watcher imports CLI sessions into Slack
+
+## Architecture Deep Dive
+
+### Event Flow
+
+When a user sends a message in a repo channel, the following happens:
+
+1. **Message Ingestion** (`src/slack/handlers.rs`)
+   - Slack Socket Mode delivers the message to Hermes via WebSocket
+   - `handle_new_message()` validates the user is in `allowed_users`
+   - Creates a placeholder "Working on it..." message in a new thread
+   - Posts the user's prompt to the thread with their @mention
+
+2. **Agent Spawn** (`src/agent/claude.rs`)
+   - Spawns `claude` CLI as a subprocess with `--stream-json` flag
+   - Passes pre-approved tools via `-p` flag (merged from defaults + repo config)
+   - Sends initial prompt via stdin using Stream-JSON protocol
+   - Starts reading events from stdout
+
+3. **Event Processing** (`src/slack/handlers.rs:process_events`)
+   - Reads Stream-JSON events line-by-line from agent stdout
+   - **Text events** → Accumulates text, updates Slack message in real-time (live mode) or buffers (batch mode)
+   - **ToolUse events** → Logs tool invocations (Read, Bash, etc.)
+   - **AskUserQuestion events** → Posts question to Slack, waits for user reply, sends answer back to agent
+   - **TurnComplete events** → Posts final result with metadata (turns, duration)
+   - **Error events** → Posts error message, marks session as errored
+
+4. **Session Persistence** (`src/session.rs`)
+   - After the first turn completes, session info is written to `sessions.json`
+   - Stores: session_id (for `--resume`), repo, channel, thread_ts, timestamps, turn count
+   - Atomic write (temp file + rename) prevents corruption
+
+5. **Thread Replies** (`src/slack/handlers.rs:handle_thread_reply`)
+   - User replies in thread → Hermes resumes the session with `--resume <session_id>`
+   - Full conversation history is preserved by Claude CLI (not stored by Hermes)
+   - Same event processing loop as step 3
+
+6. **Graceful Shutdown** (`src/main.rs`)
+   - `Ctrl+C` or kill signal → sends kill to all active agent processes
+   - Waits for agents to terminate (5-second timeout)
+   - Final session state is persisted to `sessions.json`
+
+### Concurrency Model
+
+- **One agent per thread** — `in_progress` HashSet guards against concurrent sessions in the same thread
+- **Parallel threads** — Multiple threads can run simultaneously across different channels/repos
+- **Repo locking** — `pending_repos` prevents race conditions during session sync
+- **Rate limiting** — Per-channel rate limiter (tokio Semaphore) prevents Slack API throttling
+
+### File Organization
+
+```
+src/
+├── main.rs                  # Entry point, signal handlers, shutdown logic
+├── config.rs                # TOML parsing, validation, tool merging
+├── error.rs                 # Error types (thiserror)
+├── session.rs               # SessionStore (persistent HashMap<thread_ts, SessionInfo>)
+├── sync.rs                  # Local CLI session sync via filesystem watcher
+├── util.rs                  # Panic hook, string utilities
+├── slack/
+│   ├── mod.rs               # AppState, channel management, rate limiting
+│   ├── api.rs               # Slack API wrappers (channels, messages, reactions)
+│   ├── handlers.rs          # Message handlers, event loop, question flow
+│   └── formatting.rs        # Markdown → Slack mrkdwn conversion, message splitting
+└── agent/
+    ├── mod.rs               # Agent trait, AgentHandle, event model
+    ├── claude.rs            # ClaudeAgent implementation (subprocess management)
+    └── protocol.rs          # Stream-JSON parser and message builders
+```
+
+### Data Flow
+
+```
+User Message (Slack)
+  ↓
+Socket Mode Event
+  ↓
+handle_new_message()
+  ↓
+post_thread_reply("Working on it...")  ← Placeholder
+  ↓
+ClaudeAgent::spawn()
+  ↓
+claude --stream-json -p <tools>
+  ↓
+process_events() ← Event loop
+  ├─→ TextEvent → accumulate_text()
+  ├─→ ToolUseEvent → log tool invocation
+  ├─→ AskUserQuestionEvent → wait_for_answer() → send answer to agent
+  └─→ TurnCompleteEvent → format_agent_response() → post to Slack
+  ↓
+SessionStore::insert() → sessions.json
+  ↓
+Thread reply (Slack)
+  ↓
+handle_thread_reply()
+  ↓
+ClaudeAgent::spawn(--resume <session_id>)
+  ↓
+process_events() ← Same loop
+```
+
+## Adding a New Agent Backend
+
+Hermes is designed to support multiple AI coding agents via the `Agent` trait. Here's how to add a new backend (e.g., Aider, GPT Engineer, custom LLM):
+
+### 1. Implement the `Agent` trait
+
+Create a new file `src/agent/your_agent.rs`:
+
+```rust
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+use std::collections::HashMap;
+
+use crate::agent::{Agent, AgentEvent, AgentHandle};
+use crate::config::RepoConfig;
+use crate::error::Result;
+
+pub struct YourAgent;
+
+#[async_trait]
+impl Agent for YourAgent {
+    async fn spawn(
+        &self,
+        repo: &RepoConfig,
+        prompt: &str,
+        session_id: Option<&str>,
+        model: Option<&str>,
+        allowed_tools: Vec<String>,
+    ) -> Result<AgentHandle> {
+        // 1. Spawn your agent as a subprocess or HTTP client
+        let mut child = tokio::process::Command::new("your-agent-cli")
+            .arg("--repo")
+            .arg(&repo.path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        // 2. Set up channels for sending/receiving
+        let (event_tx, event_rx) = mpsc::channel(100);
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(10);
+        let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
+
+        // 3. Send initial prompt (adapt to your agent's protocol)
+        let mut stdin = child.stdin.take().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            loop {
+                tokio::select! {
+                    Some(msg) = stdin_rx.recv() => {
+                        if stdin.write_all(msg.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = kill_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 4. Read events from stdout (convert to AgentEvent)
+        let stdout = child.stdout.take().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                // Parse your agent's output format and emit AgentEvents
+                let event = parse_your_agent_output(&line);
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // 5. Return the handle
+        Ok(AgentHandle {
+            event_rx,
+            stdin_tx,
+            kill_tx,
+            child_handle: Some(child),
+        })
+    }
+}
+
+// Helper to convert your agent's output to AgentEvent
+fn parse_your_agent_output(line: &str) -> AgentEvent {
+    // Example: if your agent outputs JSON events
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+        match json["type"].as_str() {
+            Some("text") => AgentEvent::Text {
+                text: json["content"].as_str().unwrap_or("").to_string(),
+            },
+            Some("complete") => AgentEvent::TurnComplete {
+                result: json["result"].as_str().unwrap_or("Done").to_string(),
+                duration_ms: json["duration_ms"].as_u64().unwrap_or(0),
+                num_turns: json["turns"].as_u64().unwrap_or(1) as u32,
+                metadata: HashMap::new(),
+            },
+            _ => AgentEvent::Error {
+                message: "Unknown event type".to_string(),
+            },
+        }
+    } else {
+        // Fallback: treat as plain text
+        AgentEvent::Text { text: line.to_string() }
+    }
+}
+```
+
+### 2. Register the agent in `src/agent/mod.rs`
+
+```rust
+pub mod claude;
+pub mod your_agent;  // Add this
+
+use crate::config::AgentKind;
+
+pub fn get_agent(kind: AgentKind) -> Box<dyn Agent> {
+    match kind {
+        AgentKind::Claude => Box::new(claude::ClaudeAgent),
+        AgentKind::YourAgent => Box::new(your_agent::YourAgent),
+    }
+}
+```
+
+### 3. Add config support in `src/config.rs`
+
+```rust
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    Claude,
+    YourAgent,  // Add this
+}
+```
+
+### 4. Use it in `config.toml`
+
+```toml
+[repos.my-project]
+path = "/path/to/repo"
+agent = "youragent"  # Defaults to "claude" if not set
+```
+
+### Key Requirements
+
+- **AgentEvent stream** — Your agent must emit events (text, tools, errors, completion) via the event channel
+- **Stdin control** — Accept user input, control messages (deny/allow tool use), and session resume signals
+- **Graceful shutdown** — Respond to kill signal by terminating the subprocess cleanly
+- **Error handling** — Emit `AgentEvent::Error` on failure instead of panicking
+
+### Testing Your Agent
+
+1. Add a test repo to `config.toml` with `agent = "youragent"`
+2. `make run` to start Hermes
+3. Send a message in the test repo's channel
+4. Verify events are parsed correctly and posted to Slack
+5. Test thread replies to ensure session resumption works
+
+## License
+
+MIT

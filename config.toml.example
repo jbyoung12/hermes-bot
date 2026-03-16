@@ -1,0 +1,221 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Hermes Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Remote Claude Code control via Slack.
+# Each channel is a repo, each thread is a session.
+#
+# See: https://github.com/jbyoung12/hermes-bot
+
+# Path to session persistence file (default: "sessions.json" in working directory)
+# NOTE: This is a top-level key — it must appear BEFORE any [section] header.
+#
+# SECURITY: Ensure this path is writable and not world-readable. Session data
+# includes repo paths, Slack channel IDs, and thread metadata (but not tokens).
+#
+# sessions_file = "/var/lib/hermes/sessions.json"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Slack Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[slack]
+# ── Tokens ────────────────────────────────────────────────────────
+#
+# SECURITY BEST PRACTICES:
+#
+# 1. RECOMMENDED: Set tokens via environment variables or .env file (gitignored):
+#      export SLACK_APP_TOKEN="xapp-..."   # Socket Mode app-level token
+#      export SLACK_BOT_TOKEN="xoxb-..."   # Bot user OAuth token
+#
+# 2. ALTERNATIVE: Uncomment and set tokens here (NOT recommended for teams or
+#    version-controlled configs):
+#      app_token = "xapp-..."
+#      bot_token = "xoxb-..."
+#
+# 3. PRODUCTION: Use a secret management service (Vault, AWS Secrets Manager,
+#    1Password CLI, etc.) and inject tokens at runtime via environment.
+#
+# Token setup instructions:
+# - App Token: Slack App Settings → Basic Information → App-Level Tokens
+#   → Generate Token (add `connections:write` scope)
+# - Bot Token: Slack App Settings → OAuth & Permissions → Bot User OAuth Token
+
+# ── User Allowlist ────────────────────────────────────────────────
+#
+# Only Slack users in this list can interact with Hermes.
+# An empty list means nobody can use Hermes — add at least one user.
+#
+# Find your Slack user ID:
+#   1. Click your profile picture in Slack
+#   2. Click the three dots (···) → "Copy member ID"
+#
+# For team deployments, add all team members who should have access.
+allowed_users = ["UXXXXXXXXXX"]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Defaults (Applied to All Repos)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[defaults]
+# ── System Prompt ─────────────────────────────────────────────────
+#
+# Appended to every agent prompt. Use this to set global behavior:
+# - Keep responses concise for Slack's character limits
+# - Remind Claude to ask clarifying questions instead of guessing
+# - Enforce team code style conventions
+# append_system_prompt = "Optional extra instructions appended to the agent's system prompt."
+
+# ── Streaming Mode ────────────────────────────────────────────────
+#
+# Required. Controls how Claude's response is posted to Slack:
+#   - "live"  = Edit message in real-time as Claude streams (interactive)
+#   - "batch" = Post completed response all at once (cleaner threads)
+streaming_mode = "batch"
+
+# ── Model Selection ───────────────────────────────────────────────
+#
+# Default model for all repos. Can be overridden per-repo.
+# Default: claude-opus-4-6 (most capable)
+#
+# Common models:
+#   - claude-opus-4-6             (flagship model)
+#   - claude-sonnet-4-5-20250929  (balanced speed/quality)
+#   - claude-haiku-4-5-20251001   (fast, economical)
+#
+# model = "claude-sonnet-4-5-20250929"
+
+# ── Thread Titles ─────────────────────────────────────────────────
+#
+# Generate short titles for threads using Haiku (default: true).
+# When enabled, Hermes makes a second CLI call to summarize the prompt.
+# When disabled, the thread title is just a truncated version of the prompt.
+#
+# Set to false to reduce API costs and latency.
+# generate_titles = false
+
+# ── Tool Permissions ──────────────────────────────────────────────
+#
+# Tools approved for ALL repos. These should be safe, read-only, or broadly
+# useful. Per-repo tools are merged with these at runtime.
+#
+# Default-deny: If a tool isn't listed here or in a repo's allowed_tools,
+# Claude cannot use it.
+#
+# Safe tools (read-only):
+#   - Read, Glob, Grep       = Read and search files
+#   - WebSearch, WebFetch    = Internet research
+#   - Task                   = Spawn subagents
+#
+# Git read-only commands:
+#   - Bash(git status)       = Check repo state
+#   - Bash(git diff *)       = View changes
+#   - Bash(git log *)        = View history
+#
+# Risky tools (configure per-repo):
+#   - Edit, Write            = Modify files
+#   - Bash(npm *), Bash(cargo *), etc. = Run builds/tests
+allowed_tools = [
+    "Read", "Glob", "Grep",
+    "WebSearch", "WebFetch",
+    "Task",
+    "Bash(git status)", "Bash(git diff *)", "Bash(git log *)"
+]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Repository Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Each [repos.<name>] section defines a repo.
+# A Slack channel named #<name> is auto-created on startup.
+#
+# Channel naming:
+#   - By default, the channel name is the repo name (with "." → "-")
+#   - To use a custom channel name: channel = "custom-name"
+#
+# Reserved names:
+#   - If a channel name is reserved (previously deleted), set a custom name:
+#       [repos.my-project]
+#       channel = "my-project-dev"
+
+# ── Example: Full-stack application ──────────────────────────────
+
+[repos.my-project]
+# Required: Absolute path to the git repository
+path = "/home/user/repos/my-project"
+
+# Additional tools for this repo (merged with defaults.allowed_tools)
+# These tools are risky (write access, shell commands), so scope carefully.
+allowed_tools = ["Edit", "Write", "Bash(npm *)", "Bash(cargo *)"]
+
+# Override model for this repo (overrides defaults.model)
+# Useful for economical models on exploratory repos or powerful models on critical work.
+# model = "claude-haiku-4-5-20251001"
+
+# ── Example: Frontend-only repo ──────────────────────────────────
+
+[repos.frontend]
+path = "/home/user/repos/frontend"
+
+# Frontend-specific tools: npm and npx for build/test
+allowed_tools = ["Edit", "Write", "Bash(npm *)", "Bash(npx *)"]
+
+# ── Example: Read-only exploration repo ──────────────────────────
+
+# [repos.third-party-lib]
+# path = "/home/user/repos/some-oss-project"
+#
+# # No Edit, Write, or Bash — Claude can only read and search
+# allowed_tools = []
+#
+# # Use Haiku for cost-effective code exploration
+# model = "claude-haiku-4-5-20251001"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Performance Tuning (Optional)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Advanced settings for fine-tuning Hermes behavior.
+# Defaults are sensible for most deployments — only change if needed.
+
+# [tuning]
+# ── Slack Message Limits ──────────────────────────────────────────
+#
+# Maximum characters per Slack message (Slack's limit is ~40,000).
+# Longer responses are automatically split into multiple messages.
+# slack_max_message_chars = 39000
+
+# ── Session Management ────────────────────────────────────────────
+#
+# Days before inactive sessions are pruned from sessions.json.
+# Sessions older than this won't auto-resume but can still be manually resumed
+# if the Claude CLI session state exists.
+# session_ttl_days = 7
+
+# ── Live Streaming ────────────────────────────────────────────────
+#
+# How often to update Slack messages in "live" streaming mode (seconds).
+# Lower = more responsive, higher = fewer Slack API calls.
+# live_update_interval_secs = 2
+
+# ── Rate Limiting ─────────────────────────────────────────────────
+#
+# Minimum milliseconds between Slack API calls to the same channel.
+# Prevents hitting Slack rate limits. Increase if you see rate limit errors.
+# rate_limit_interval_ms = 1100
+
+# ── Memory Safety ─────────────────────────────────────────────────
+#
+# Maximum bytes of accumulated text before flushing in streaming mode.
+# Prevents unbounded memory growth on very long responses.
+# max_accumulated_text_bytes = 1000000
+
+# ── Retry Logic ───────────────────────────────────────────────────
+#
+# Maximum retries when posting the first chunk of a response.
+# first_chunk_max_retries = 5
+
+# ── Logging ───────────────────────────────────────────────────────
+#
+# Maximum length of log message previews (truncated if longer).
+# log_preview_max_len = 200

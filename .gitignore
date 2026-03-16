@@ -1,0 +1,27 @@
+/target
+config.toml
+sessions.json
+sessions.json.tmp
+schedules.json
+.env
+
+# Claude Code
+.claude/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / credentials
+*.pem
+*.key
+
+# Logs
+*.log

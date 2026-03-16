@@ -1,0 +1,43 @@
+{
+  "display_information": {
+    "name": "Hermes",
+    "description": "Remote Claude Code control via Slack",
+    "background_color": "#2c2c2c"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Hermes",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/claude",
+        "description": "Hermes — Claude Code via Slack",
+        "usage_hint": "sessions | help",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "channels:manage",
+        "channels:read",
+        "channels:history",
+        "chat:write",
+        "commands",
+        "reactions:read",
+        "reactions:write"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "message.channels"
+      ]
+    },
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
