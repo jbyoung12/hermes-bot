@@ -137,7 +137,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 heartbeat_state.cleanup_stale_pending_repos().await;
 
                 // Prune expired sessions every 5 minutes (every 5 ticks).
-                if tick_count % 5 == 0 {
+                if tick_count.is_multiple_of(5) {
                     heartbeat_state
                         .sessions
                         .prune_expired(heartbeat_state.config.tuning.session_ttl_days)

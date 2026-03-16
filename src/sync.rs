@@ -130,7 +130,7 @@ fn extract_assistant_text(val: &serde_json::Value) -> Option<String> {
 
 /// Extract a session ID from a .jsonl file path.
 fn session_id_from_path(path: &Path) -> Option<String> {
-    if !path.extension().is_some_and(|e| e == "jsonl") {
+    if path.extension().is_none_or(|e| e != "jsonl") {
         return None;
     }
     path.file_stem().map(|s| s.to_string_lossy().to_string())

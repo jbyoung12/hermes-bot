@@ -201,11 +201,11 @@ pub(crate) async fn handle_event_result(
                 // limit and we have a placeholder message, edit it in place.
                 if chunks.len() == 1
                     && chunks[0].len() <= SLACK_UPDATE_MAX_CHARS
-                    && config.status_ts.is_some()
                 {
-                    let ts = config.status_ts.as_ref().unwrap();
-                    update_message(state, channel_id, ts, &chunks[0]).await;
-                    posted = true;
+                    if let Some(ref ts) = config.status_ts {
+                        update_message(state, channel_id, ts, &chunks[0]).await;
+                        posted = true;
+                    }
                 } else {
                     // Delete the placeholder — we'll post full messages instead.
                     if let Some(ref ts) = config.status_ts {

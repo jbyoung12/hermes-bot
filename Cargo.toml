@@ -2,7 +2,7 @@
 name = "hermes-bot"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.94"
 description = "Remote Claude Code control via Slack — each channel is a repo, each thread is a session"
 license = "MIT"
 repository = "https://github.com/jbyoung12/hermes-bot"
@@ -30,7 +30,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-slack-morphism = { version = "2.18", features = ["hyper"] }
+slack-morphism = { version = "2.19", features = ["hyper"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "process", "time", "fs", "signal"] }
@@ -41,5 +41,5 @@ notify = "8"
 regex = "1"
 
 [dev-dependencies]
-rstest = "0.18"
-rand = "0.8"
+rstest = "0.26"
+rand = "0.10"
