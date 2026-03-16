@@ -41,5 +41,5 @@ notify = "8"
 regex = "1"
 
 [dev-dependencies]
-rstest = "0.18"
+rstest = "0.26"
 rand = "0.8"
