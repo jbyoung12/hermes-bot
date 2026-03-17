@@ -161,6 +161,11 @@ pub async fn sync_sessions(state: AppState) {
     let mut repos: Vec<RepoSyncInfo> = Vec::new();
 
     for (repo_name, repo_config) in &state.config.repos {
+        if !repo_config.sync_enabled(&state.config.defaults) {
+            info!("Sync disabled for repo '{}', skipping", repo_name);
+            continue;
+        }
+
         let encoded = encode_project_path(&repo_config.path);
         let project_dir = claude_projects_dir.join(&encoded);
 

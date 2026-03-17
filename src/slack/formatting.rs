@@ -26,6 +26,8 @@ pub(crate) struct AgentResponse {
     pub(crate) duration_ms: u64,
     pub(crate) num_turns: u32,
     pub(crate) subtype: Option<String>,
+    /// Summary of interesting tool usage during this turn (e.g. Edit, Write, WebSearch).
+    pub(crate) tool_summary: Option<String>,
 }
 
 // ── Markdown conversion ────────────────────────────────────────────────
@@ -212,15 +214,21 @@ pub(crate) fn format_agent_response(resp: &AgentResponse) -> Vec<String> {
     let hit_turn_limit = resp.subtype.as_deref() == Some("max_turns_reached")
         || resp.subtype.as_deref() == Some("error_max_turns");
 
+    let tool_line = resp
+        .tool_summary
+        .as_ref()
+        .map(|s| format!("{}\n", s))
+        .unwrap_or_default();
+
     let footer = if hit_turn_limit {
         format!(
-            "\n\n-----\n:warning: *Hit turn limit ({} turns, {}).* Reply in this thread to continue where Claude left off.",
-            resp.num_turns, duration
+            "\n\n-----\n{}_:warning: Hit turn limit ({} turns, {})._ Reply in this thread to continue where Claude left off.",
+            tool_line, resp.num_turns, duration
         )
     } else {
         format!(
-            "\n\n-----\n_Turns: {} | Duration: {}_",
-            resp.num_turns, duration
+            "\n\n-----\n{}_Turns: {} | Duration: {}_",
+            tool_line, resp.num_turns, duration
         )
     };
 

@@ -133,11 +133,11 @@ Hermes auto-creates channels from repo names (e.g., `repos.backend` → `#backen
 
 **In threads:**
 
-- `/status` — Show session info
-- `/stop` — Stop session
-- `/model` — Show current model
-- `/model opus` — Switch to Opus (also: `sonnet`, `haiku`)
-- `/execute` — Run last plan with fresh context
+- `!status` — Show session info
+- `!stop` — Stop session
+- `!model` — Show current model
+- `!model opus` — Switch to Opus (also: `sonnet`, `haiku`)
+- `!execute` — Run last plan with fresh context
 
 **Slash commands:**
 
@@ -154,6 +154,16 @@ Local session detected (branch: main)
 ```
 
 Reply in the Slack thread to continue.
+
+To disable sync globally or per-repo:
+
+```toml
+[defaults]
+sync_local_sessions = false  # disable for all repos
+
+[repos.my-project]
+sync_local_sessions = true   # re-enable for this repo only
+```
 
 ### Security & Permissions
 

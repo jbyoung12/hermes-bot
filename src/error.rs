@@ -36,6 +36,10 @@ pub enum HermesError {
     /// TOML configuration parse error
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),
+
+    /// SQLite database error
+    #[error("Database error: {0}")]
+    Database(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, HermesError>;

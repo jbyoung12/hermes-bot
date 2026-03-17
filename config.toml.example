@@ -7,13 +7,16 @@
 #
 # See: https://github.com/jbyoung12/hermes-bot
 
-# Path to session persistence file (default: "sessions.json" in working directory)
+# Path to session persistence database (default: "sessions.db" in working directory)
 # NOTE: This is a top-level key — it must appear BEFORE any [section] header.
+#
+# Uses SQLite with WAL mode. If a legacy sessions.json file exists next to the
+# database, it will be migrated automatically on startup.
 #
 # SECURITY: Ensure this path is writable and not world-readable. Session data
 # includes repo paths, Slack channel IDs, and thread metadata (but not tokens).
 #
-# sessions_file = "/var/lib/hermes/sessions.json"
+# sessions_file = "/var/lib/hermes/sessions.db"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Slack Configuration
@@ -94,6 +97,15 @@ streaming_mode = "batch"
 # Set to false to reduce API costs and latency.
 # generate_titles = false
 
+# ── Local Session Sync ───────────────────────────────────────────
+#
+# Watch for local Claude Code sessions and sync them into Slack threads.
+# When enabled, sessions started from the CLI are mirrored to the repo's channel.
+# When disabled, Hermes only handles sessions started from Slack.
+#
+# Can be overridden per-repo. Default: true.
+# sync_local_sessions = false
+
 # ── Tool Permissions ──────────────────────────────────────────────
 #
 # Tools approved for ALL repos. These should be safe, read-only, or broadly
@@ -152,6 +164,9 @@ allowed_tools = ["Edit", "Write", "Bash(npm *)", "Bash(cargo *)"]
 # Useful for economical models on exploratory repos or powerful models on critical work.
 # model = "claude-haiku-4-5-20251001"
 
+# Override local session sync for this repo (overrides defaults.sync_local_sessions)
+# sync_local_sessions = false
+
 # ── Example: Frontend-only repo ──────────────────────────────────
 
 [repos.frontend]
@@ -187,7 +202,7 @@ allowed_tools = ["Edit", "Write", "Bash(npm *)", "Bash(npx *)"]
 
 # ── Session Management ────────────────────────────────────────────
 #
-# Days before inactive sessions are pruned from sessions.json.
+# Days before inactive sessions are pruned from the database.
 # Sessions older than this won't auto-resume but can still be manually resumed
 # if the Claude CLI session state exists.
 # session_ttl_days = 7

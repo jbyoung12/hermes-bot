@@ -90,11 +90,20 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
 
     // Spawn session sync (watch for local Claude Code sessions).
-    // Keep the handle to ensure panics/errors don't go silent.
-    let sync_state = state.clone();
-    let sync_handle = tokio::spawn(async move {
-        sync::sync_sessions(sync_state).await;
-    });
+    // Skip entirely if no repos have sync enabled.
+    let any_sync_enabled = config
+        .repos
+        .values()
+        .any(|r| r.sync_enabled(&config.defaults));
+    let sync_handle = if any_sync_enabled {
+        let sync_state = state.clone();
+        Some(tokio::spawn(async move {
+            sync::sync_sessions(sync_state).await;
+        }))
+    } else {
+        info!("Local session sync disabled for all repos, skipping");
+        None
+    };
 
     // Set up Socket Mode listener.
     let shutdown_state = state.clone();
@@ -172,11 +181,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     shutdown_state.pending_answers.lock().await.clear();
 
     // Abort the sync task gracefully (it's an infinite loop, so we abort it).
-    sync_handle.abort();
-    match sync_handle.await {
-        Ok(_) => info!("Session sync task stopped cleanly"),
-        Err(e) if e.is_cancelled() => info!("Session sync task cancelled"),
-        Err(e) => error!("Session sync task failed: {}", e),
+    if let Some(sync_handle) = sync_handle {
+        sync_handle.abort();
+        match sync_handle.await {
+            Ok(_) => info!("Session sync task stopped cleanly"),
+            Err(e) if e.is_cancelled() => info!("Session sync task cancelled"),
+            Err(e) => error!("Session sync task failed: {}", e),
+        }
     }
 
     info!("Shutdown complete");

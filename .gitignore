@@ -2,6 +2,10 @@
 config.toml
 sessions.json
 sessions.json.tmp
+sessions.json.bak
+sessions.db
+sessions.db-wal
+sessions.db-shm
 schedules.json
 .env
 

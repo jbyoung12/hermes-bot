@@ -95,6 +95,7 @@ fn format_turn_result(
     duration_ms: u64,
     num_turns: u32,
     subtype: String,
+    tool_summary: Option<String>,
 ) -> Vec<String> {
     let resp = AgentResponse {
         result: result_text.unwrap_or_default(),
@@ -102,6 +103,7 @@ fn format_turn_result(
         duration_ms,
         num_turns,
         subtype: Some(subtype),
+        tool_summary,
     };
     formatting::format_agent_response(&resp)
 }
@@ -184,6 +186,7 @@ pub(crate) async fn handle_event_result(
             session_id,
             streamed,
             plan_posted,
+            tool_summary,
         } => {
             // Update the thread root with the title (new sessions only).
             if let Some(ref title) = config.title {
@@ -194,8 +197,14 @@ pub(crate) async fn handle_event_result(
             // or a plan was already posted (to avoid duplication).
             let mut posted = streamed || plan_posted;
             if !streamed && !plan_posted {
-                let chunks =
-                    format_turn_result(result_text, is_error, duration_ms, num_turns, subtype);
+                let chunks = format_turn_result(
+                    result_text,
+                    is_error,
+                    duration_ms,
+                    num_turns,
+                    subtype,
+                    tool_summary,
+                );
 
                 // If the response is a single chunk that fits in the update
                 // limit and we have a placeholder message, edit it in place.
@@ -288,7 +297,7 @@ pub(crate) async fn handle_event_result(
                     let new_session_id = session_id;
                     if let Err(e) = state
                         .sessions
-                        .update(thread_ts, |s| {
+                        .update(thread_ts, move |s| {
                             s.last_active = Utc::now();
                             s.total_turns = num_turns;
                             s.session_id = new_session_id.clone();
@@ -608,20 +617,20 @@ pub(crate) async fn handle_thread_reply(
 ) {
     // Check for thread commands.
     let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("/stop") {
+    if trimmed.eq_ignore_ascii_case("!stop") {
         handle_stop(&state, &channel_id, &thread_ts).await;
         return;
     }
-    if trimmed.eq_ignore_ascii_case("/status") {
+    if trimmed.eq_ignore_ascii_case("!status") {
         handle_status(&state, &channel_id, &thread_ts).await;
         return;
     }
-    if trimmed.eq_ignore_ascii_case("/execute") {
+    if trimmed.eq_ignore_ascii_case("!execute") {
         handle_execute_plan(state, channel_id, thread_ts, message_ts).await;
         return;
     }
     if let Some(rest) = trimmed
-        .strip_prefix("/model")
+        .strip_prefix("!model")
         .filter(|r| r.is_empty() || r.starts_with(' '))
     {
         handle_model_command(&state, &channel_id, &thread_ts, rest.trim()).await;
@@ -637,7 +646,7 @@ pub(crate) async fn handle_thread_reply(
     // Check if this thread is waiting for a tool approval.
     if let Some(approval_tx) = state.pending_tool_approvals.lock().await.remove(&thread_ts) {
         let trimmed = text.trim().to_lowercase();
-        let approved = matches!(trimmed.as_str(), "y" | "yes" | "allow" | "/allow");
+        let approved = matches!(trimmed.as_str(), "y" | "yes" | "allow" | "!allow");
         let _ = approval_tx.send(approved);
         return;
     }
@@ -753,7 +762,7 @@ pub(crate) async fn handle_thread_reply(
                     .await;
                     if let Err(e) = state_clone
                         .sessions
-                        .update(&thread_ts_clone, |s| {
+                        .update(&thread_ts_clone, move |s| {
                             s.status = SessionStatus::Error;
                         })
                         .await
@@ -831,11 +840,129 @@ pub(crate) enum EventResult {
         /// True when a plan file was already posted to Slack during this turn.
         /// Callers should suppress the duplicate result text.
         plan_posted: bool,
+        /// Summary of interesting tool usage during this turn (e.g. Edit, Write, WebSearch).
+        tool_summary: Option<String>,
     },
     ProcessExited {
         code: Option<i32>,
     },
     ChannelClosed,
+}
+
+/// Accumulates interesting tool usage during a turn for a summary footer.
+struct ToolUseSummary {
+    tools: Vec<(String, Vec<String>)>,
+}
+
+impl ToolUseSummary {
+    fn new() -> Self {
+        Self { tools: Vec::new() }
+    }
+
+    /// Record a tool use. Only tracks interesting tools; skips noisy ones
+    /// like Read, Grep, Glob, etc.
+    fn record(&mut self, name: &str, input: &serde_json::Value) {
+        match name {
+            "Edit" | "Write" => {
+                let detail = input
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| {
+                        // Skip plan file writes from the summary
+                        if name == "Write" && p.contains(".claude/plans/") {
+                            return None;
+                        }
+                        // Extract basename
+                        Some(p.rsplit('/').next().unwrap_or(p).to_string())
+                    });
+
+                if let Some(basename) = detail {
+                    // Find existing entry for this tool or create one
+                    if let Some(entry) = self.tools.iter_mut().find(|(t, _)| t == name) {
+                        if !entry.1.contains(&basename) {
+                            entry.1.push(basename);
+                        }
+                    } else {
+                        self.tools.push((name.to_string(), vec![basename]));
+                    }
+                }
+            }
+            "Task" => {
+                let detail = input
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("subagent")
+                    .to_string();
+                let truncated = if detail.len() > 60 {
+                    format!("{}...", &detail[..57])
+                } else {
+                    detail
+                };
+                if let Some(entry) = self.tools.iter_mut().find(|(t, _)| t == name) {
+                    entry.1.push(truncated);
+                } else {
+                    self.tools.push((name.to_string(), vec![truncated]));
+                }
+            }
+            "WebSearch" => {
+                let query = input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("search")
+                    .to_string();
+                if let Some(entry) = self.tools.iter_mut().find(|(t, _)| t == name) {
+                    entry.1.push(format!("\"{}\"", query));
+                } else {
+                    self.tools
+                        .push((name.to_string(), vec![format!("\"{}\"", query)]));
+                }
+            }
+            "WebFetch" => {
+                let url = input
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("url")
+                    .to_string();
+                if let Some(entry) = self.tools.iter_mut().find(|(t, _)| t == name) {
+                    entry.1.push(url);
+                } else {
+                    self.tools.push((name.to_string(), vec![url]));
+                }
+            }
+            "Bash" => {
+                let cmd = input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("command")
+                    .to_string();
+                let truncated = if cmd.len() > 60 {
+                    format!("`{}...`", &cmd[..57])
+                } else {
+                    format!("`{}`", cmd)
+                };
+                if let Some(entry) = self.tools.iter_mut().find(|(t, _)| t == name) {
+                    entry.1.push(truncated);
+                } else {
+                    self.tools.push((name.to_string(), vec![truncated]));
+                }
+            }
+            _ => {} // Skip noisy tools: Read, Grep, Glob, etc.
+        }
+    }
+
+    /// Format the summary for display, e.g.:
+    /// `Edit(config.rs, main.rs) | Write(new_file.rs) | WebSearch("rust async patterns")`
+    fn format(&self) -> Option<String> {
+        if self.tools.is_empty() {
+            return None;
+        }
+        let parts: Vec<String> = self
+            .tools
+            .iter()
+            .map(|(name, details)| format!("{}({})", name, details.join(", ")))
+            .collect();
+        Some(parts.join(" | "))
+    }
 }
 
 /// Process agent events until TurnComplete or ProcessExited.
@@ -852,6 +979,10 @@ pub(crate) async fn process_events(
     let mut last_update = std::time::Instant::now();
     let mut streamed = false;
     let mut plan_posted = false;
+    let mut tool_summary = ToolUseSummary::new();
+    // Deferred plan: capture the latest plan content instead of posting inline.
+    // Posted once at TurnComplete so repeated writes only show the final version.
+    let mut latest_plan: Option<String> = None;
 
     loop {
         let event = match handle.receiver.recv().await {
@@ -911,7 +1042,10 @@ pub(crate) async fn process_events(
                 ref name,
                 ref input,
             } => {
-                // Surface plan files written to ~/.claude/plans/ so they're visible in Slack.
+                // Record tool usage for the summary footer.
+                tool_summary.record(name, input);
+
+                // Capture plan files written to ~/.claude/plans/ for deferred posting.
                 if name == "Write"
                     && let Some(path) = input.get("file_path").and_then(|v| v.as_str())
                     && path.contains(".claude/plans/")
@@ -923,27 +1057,15 @@ pub(crate) async fn process_events(
                         warn!("Plan validation failed: {}", e);
                         post_thread_reply(state, channel_id, thread_ts, &format!("⚠️ {}", e)).await;
                     } else {
-                        let formatted_content =
-                            crate::slack::formatting::markdown_to_slack(content);
-                        let plan_msg = format!("*Plan*\n\n{}", formatted_content);
-                        post_thread_reply(state, channel_id, thread_ts, &plan_msg).await;
+                        // Defer posting — store the latest version to post at TurnComplete.
+                        latest_plan = Some(content.to_string());
 
-                        // Store plan content for !execute command.
+                        // Always update last_plan for !execute command.
                         state
                             .last_plan
                             .lock()
                             .await
                             .insert(thread_ts.to_string(), content.to_string());
-
-                        post_thread_reply(
-                            state,
-                            channel_id,
-                            thread_ts,
-                            "_Reply `/execute` to run this plan with a fresh context window._",
-                        )
-                        .await;
-
-                        plan_posted = true;
                     }
                 }
 
@@ -1068,6 +1190,22 @@ pub(crate) async fn process_events(
                     delete_message(state, channel_id, ts).await;
                 }
 
+                // Post deferred plan if one was captured during this turn.
+                if let Some(plan_content) = latest_plan {
+                    let formatted_content =
+                        crate::slack::formatting::markdown_to_slack(&plan_content);
+                    let plan_msg = format!("*Plan*\n\n{}", formatted_content);
+                    post_thread_reply(state, channel_id, thread_ts, &plan_msg).await;
+                    post_thread_reply(
+                        state,
+                        channel_id,
+                        thread_ts,
+                        "_Reply `!execute` to run this plan with a fresh context window._",
+                    )
+                    .await;
+                    plan_posted = true;
+                }
+
                 return EventResult::TurnComplete {
                     result_text: result,
                     subtype,
@@ -1077,6 +1215,7 @@ pub(crate) async fn process_events(
                     session_id,
                     streamed,
                     plan_posted,
+                    tool_summary: tool_summary.format(),
                 };
             }
             AgentEvent::ToolProgress { tool_name } => {
@@ -1092,7 +1231,7 @@ pub(crate) async fn process_events(
     }
 }
 
-// ── /stop / /status / /model ───────────────────────────────────────────
+// ── !stop / !status / !model ───────────────────────────────────────────
 
 async fn handle_stop(state: &AppState, channel_id: &str, thread_ts: &str) {
     // Kill the agent process if running.
@@ -1185,7 +1324,7 @@ async fn handle_model_command(state: &AppState, channel_id: &str, thread_ts: &st
             channel_id,
             thread_ts,
             &format!(
-                "Current model: `{}`\nUse `/model <name>` to change. Aliases: `opus`, `sonnet`, `haiku`.",
+                "Current model: `{}`\nUse `!model <name>` to change. Aliases: `opus`, `sonnet`, `haiku`.",
                 model
             ),
         )
@@ -1430,11 +1569,11 @@ pub async fn handle_slash_command(
                 "*Hermes — Claude Code via Slack*\n\n",
                 "Just type in a repo channel to start a session. Reply in the thread to continue.\n\n",
                 "*Thread commands:*\n",
-                "`/status` — show session info\n",
-                "`/stop` — stop the session\n",
-                "`/model` — show current model\n",
-                "`/model <name>` — set model (`opus`, `sonnet`, `haiku`, or full ID)\n",
-                "`/execute` — run the last plan with a fresh context\n\n",
+                "`!status` — show session info\n",
+                "`!stop` — stop the session\n",
+                "`!model` — show current model\n",
+                "`!model <name>` — set model (`opus`, `sonnet`, `haiku`, or full ID)\n",
+                "`!execute` — run the last plan with a fresh context\n\n",
                 "*Slash commands:*\n",
                 "`/claude sessions` — list active sessions\n",
                 "`/claude help` — this message",

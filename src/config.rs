@@ -13,13 +13,13 @@ pub struct Config {
     pub tuning: TuningConfig,
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
-    /// Path to the session store file. Defaults to "sessions.json" in the working directory.
+    /// Path to the session store database. Defaults to "sessions.db" in the working directory.
     #[serde(default = "default_sessions_file")]
     pub sessions_file: PathBuf,
 }
 
 fn default_sessions_file() -> PathBuf {
-    PathBuf::from("sessions.json")
+    PathBuf::from("sessions.db")
 }
 
 impl std::fmt::Debug for Config {
@@ -87,6 +87,13 @@ pub struct DefaultsConfig {
     pub streaming_mode: StreamingMode,
     #[serde(default)]
     pub model: Option<String>,
+    /// Enable syncing local Claude Code sessions into Slack. Default: true.
+    #[serde(default = "default_true")]
+    pub sync_local_sessions: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
@@ -117,6 +124,9 @@ pub struct RepoConfig {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Override the global sync_local_sessions setting for this repo.
+    #[serde(default)]
+    pub sync_local_sessions: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -174,6 +184,12 @@ impl RepoConfig {
             }
         }
         tools
+    }
+
+    /// Returns whether local session sync is enabled: repo override > global default (true).
+    pub fn sync_enabled(&self, defaults: &DefaultsConfig) -> bool {
+        self.sync_local_sessions
+            .unwrap_or(defaults.sync_local_sessions)
     }
 
     /// Returns the model for this repo: repo override > global default > DEFAULT_MODEL.
@@ -342,20 +358,20 @@ streaming_mode = "live"
 [defaults]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.sessions_file, PathBuf::from("sessions.json"));
+        assert_eq!(config.sessions_file, PathBuf::from("sessions.db"));
     }
 
     #[test]
     fn test_sessions_file_custom() {
         let toml = r#"
-sessions_file = "/var/lib/hermes/sessions.json"
+sessions_file = "/var/lib/hermes/sessions.db"
 [slack]
 [defaults]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(
             config.sessions_file,
-            PathBuf::from("/var/lib/hermes/sessions.json")
+            PathBuf::from("/var/lib/hermes/sessions.db")
         );
     }
 
@@ -366,6 +382,7 @@ sessions_file = "/var/lib/hermes/sessions.json"
             allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
             streaming_mode: StreamingMode::Batch,
             model: None,
+            sync_local_sessions: true,
         }
     }
 
@@ -377,6 +394,7 @@ sessions_file = "/var/lib/hermes/sessions.json"
             channel: None,
             allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
             model: None,
+            sync_local_sessions: None,
         }
     }
 
@@ -520,6 +538,7 @@ path = "/tmp"
             allowed_tools: vec![],
             streaming_mode: StreamingMode::Batch,
             model: None,
+            sync_local_sessions: true,
         };
         let repo = RepoConfig {
             path: PathBuf::from("/tmp"),
@@ -527,6 +546,7 @@ path = "/tmp"
             channel: None,
             allowed_tools: vec![],
             model: None,
+            sync_local_sessions: None,
         };
         assert_eq!(repo.resolved_model(&defaults), DEFAULT_MODEL);
     }
@@ -538,6 +558,7 @@ path = "/tmp"
             allowed_tools: vec![],
             streaming_mode: StreamingMode::Batch,
             model: Some("claude-sonnet-4-5-20250929".to_string()),
+            sync_local_sessions: true,
         };
         let repo = RepoConfig {
             path: PathBuf::from("/tmp"),
@@ -545,6 +566,7 @@ path = "/tmp"
             channel: None,
             allowed_tools: vec![],
             model: None,
+            sync_local_sessions: None,
         };
         assert_eq!(repo.resolved_model(&defaults), "claude-sonnet-4-5-20250929");
     }
@@ -556,6 +578,7 @@ path = "/tmp"
             allowed_tools: vec![],
             streaming_mode: StreamingMode::Batch,
             model: Some("claude-sonnet-4-5-20250929".to_string()),
+            sync_local_sessions: true,
         };
         let repo = RepoConfig {
             path: PathBuf::from("/tmp"),
@@ -563,7 +586,40 @@ path = "/tmp"
             channel: None,
             allowed_tools: vec![],
             model: Some("claude-haiku-4-5-20251001".to_string()),
+            sync_local_sessions: None,
         };
         assert_eq!(repo.resolved_model(&defaults), "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn test_sync_enabled_defaults_to_true() {
+        let defaults = make_defaults(vec![]);
+        let repo = make_repo(vec![]);
+        assert!(repo.sync_enabled(&defaults));
+    }
+
+    #[test]
+    fn test_sync_enabled_global_disable() {
+        let mut defaults = make_defaults(vec![]);
+        defaults.sync_local_sessions = false;
+        let repo = make_repo(vec![]);
+        assert!(!repo.sync_enabled(&defaults));
+    }
+
+    #[test]
+    fn test_sync_enabled_repo_override_enable() {
+        let mut defaults = make_defaults(vec![]);
+        defaults.sync_local_sessions = false;
+        let mut repo = make_repo(vec![]);
+        repo.sync_local_sessions = Some(true);
+        assert!(repo.sync_enabled(&defaults));
+    }
+
+    #[test]
+    fn test_sync_enabled_repo_override_disable() {
+        let defaults = make_defaults(vec![]);
+        let mut repo = make_repo(vec![]);
+        repo.sync_local_sessions = Some(false);
+        assert!(!repo.sync_enabled(&defaults));
     }
 }

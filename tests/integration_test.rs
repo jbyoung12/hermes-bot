@@ -7,10 +7,16 @@ mod common;
 use common::make_test_session;
 use hermes_bot::session::SessionStore;
 
+fn cleanup_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
 #[tokio::test]
 async fn test_session_persistence() {
     // Test that sessions can be inserted and retrieved
-    let path = std::env::temp_dir().join(format!("test_session_{}.json", rand::random::<u64>()));
+    let path = std::env::temp_dir().join(format!("test_session_{}.db", rand::random::<u64>()));
     let store = SessionStore::new(path.clone());
 
     let session = make_test_session("s1", "t1", "test-repo");
@@ -20,13 +26,13 @@ async fn test_session_persistence() {
     assert_eq!(retrieved.session_id, "s1");
     assert_eq!(retrieved.repo, "test-repo");
 
-    let _ = std::fs::remove_file(&path);
+    cleanup_db(&path);
 }
 
 #[tokio::test]
 async fn test_session_update() {
     // Test that sessions can be updated
-    let path = std::env::temp_dir().join(format!("test_session_{}.json", rand::random::<u64>()));
+    let path = std::env::temp_dir().join(format!("test_session_{}.db", rand::random::<u64>()));
     let store = SessionStore::new(path.clone());
 
     store
@@ -44,13 +50,13 @@ async fn test_session_update() {
     let retrieved = store.get_by_thread("t1").await.unwrap();
     assert_eq!(retrieved.total_turns, 5);
 
-    let _ = std::fs::remove_file(&path);
+    cleanup_db(&path);
 }
 
 #[tokio::test]
 async fn test_active_sessions_filter() {
     // Test that active_sessions filters out errored sessions
-    let path = std::env::temp_dir().join(format!("test_session_{}.json", rand::random::<u64>()));
+    let path = std::env::temp_dir().join(format!("test_session_{}.db", rand::random::<u64>()));
     let store = SessionStore::new(path.clone());
 
     let session1 = make_test_session("s1", "t1", "test-repo");
@@ -64,13 +70,13 @@ async fn test_active_sessions_filter() {
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].session_id, "s1");
 
-    let _ = std::fs::remove_file(&path);
+    cleanup_db(&path);
 }
 
 #[tokio::test]
 async fn test_session_ttl_pruning() {
     // Test that old sessions are pruned
-    let path = std::env::temp_dir().join(format!("test_session_{}.json", rand::random::<u64>()));
+    let path = std::env::temp_dir().join(format!("test_session_{}.db", rand::random::<u64>()));
     let store = SessionStore::new(path.clone());
 
     let mut old_session = make_test_session("s1", "t1", "test-repo");
@@ -87,13 +93,13 @@ async fn test_session_ttl_pruning() {
     assert!(store.get_by_thread("t1").await.is_none());
     assert!(store.get_by_thread("t2").await.is_some());
 
-    let _ = std::fs::remove_file(&path);
+    cleanup_db(&path);
 }
 
 #[tokio::test]
 async fn test_session_has_session_id() {
     // Test session ID lookup
-    let path = std::env::temp_dir().join(format!("test_session_{}.json", rand::random::<u64>()));
+    let path = std::env::temp_dir().join(format!("test_session_{}.db", rand::random::<u64>()));
     let store = SessionStore::new(path.clone());
 
     store
@@ -104,13 +110,13 @@ async fn test_session_has_session_id() {
     assert!(store.has_session_id("s1").await);
     assert!(!store.has_session_id("nonexistent").await);
 
-    let _ = std::fs::remove_file(&path);
+    cleanup_db(&path);
 }
 
 #[tokio::test]
 async fn test_session_persistence_across_reload() {
     // Test that sessions survive a reload
-    let path = std::env::temp_dir().join(format!("test_session_{}.json", rand::random::<u64>()));
+    let path = std::env::temp_dir().join(format!("test_session_{}.db", rand::random::<u64>()));
 
     {
         let store = SessionStore::new(path.clone());
@@ -125,7 +131,7 @@ async fn test_session_persistence_across_reload() {
     let retrieved = store2.get_by_thread("t1").await.unwrap();
     assert_eq!(retrieved.session_id, "s1");
 
-    let _ = std::fs::remove_file(&path);
+    cleanup_db(&path);
 }
 
 #[tokio::test]

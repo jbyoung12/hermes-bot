@@ -22,7 +22,7 @@ src/
   lib.rs           Library crate for integration tests (re-exports all modules)
   config.rs        Configuration loading/validation (config.toml, env vars, tuning params)
   error.rs         Error types (thiserror): Config, Session, Agent, Slack, IO, JSON, TOML
-  session.rs       Session persistence (sessions.json) with atomic writes and TTL pruning
+  session.rs       Session persistence (SQLite) with per-row updates and TTL pruning
   sync.rs          Local CLI session sync — filesystem watcher imports local sessions into Slack
   util.rs          Utilities (floor_char_boundary, panic hook)
   slack/
@@ -55,12 +55,12 @@ tests/
 - **Agent trait** (`src/agent/mod.rs`) — async trait for agent backends; `ClaudeAgent` is the implementation
 - **Stream-JSON protocol** — bidirectional NDJSON communication with Claude Code CLI via stdin/stdout
 - **AppState** (`src/slack/mod.rs`) — shared state passed through Slack event handlers (wrapped in `Arc`)
-- **Session persistence** — `SessionStore` reads/writes `sessions.json` with atomic tmp-file swaps; TTL-based pruning
+- **Session persistence** — `SessionStore` uses SQLite (`sessions.db`) with WAL mode, per-row updates, and TTL-based pruning; auto-migrates legacy `sessions.json`
 - **Concurrency** — `in_progress` set guards one agent per thread; new messages interrupt running agents; `kill_senders` for graceful shutdown
 - **Local session sync** — filesystem watcher (FSEvents/inotify via `notify` crate) imports local CLI sessions into Slack threads with TOCTOU-safe claim logic
 - **Rate limiting** — per-channel rate limiter prevents Slack API throttling (configurable interval)
 - **Streaming modes** — `batch` (post full response after completion) or `live` (edit messages in real-time via chat.update)
-- **Plan detection** — intercepts Write tool calls to `~/.claude/plans/`, posts plan content to Slack, supports `/execute` to re-run with fresh context
+- **Plan detection** — intercepts Write tool calls to `~/.claude/plans/`, posts plan content to Slack, supports `!execute` to re-run with fresh context
 - **Interactive control requests** — AskUserQuestion and tool approval prompts forwarded to Slack threads, answered via thread replies
 - **Heartbeat loop** — 60s interval for stale pending repo cleanup; 5-minute interval for expired session pruning
 
@@ -68,11 +68,11 @@ tests/
 
 - **New channel message** → spawns new Claude Code session, creates thread
 - **Thread reply** → resumes session (auto-respawns with `--resume` if process exited)
-- **Thread commands**: `/stop`, `/status`, `/model [name]`, `/execute`
+- **Thread commands**: `!stop`, `!status`, `!model [name]`, `!execute`
 - **Slash command**: `/claude sessions`, `/claude help`
 - **Question flow** — Claude asks via AskUserQuestion → posted to thread → user replies → answer forwarded via control_response
 - **Tool approval flow** — unapproved tool use → posted to thread → user replies yes/no → allow/deny via control_response
-- **Model aliases** — `opus`, `sonnet`, `haiku` resolve to full model IDs; per-thread overrides via `/model`
+- **Model aliases** — `opus`, `sonnet`, `haiku` resolve to full model IDs; per-thread overrides via `!model`
 
 ## Configuration
 
@@ -80,10 +80,11 @@ tests/
 - `.env` — Slack tokens: `SLACK_APP_TOKEN` (xapp-), `SLACK_BOT_TOKEN` (xoxb-) (gitignored)
 - `HERMES_CONFIG` env var — override config file path (defaults to `config.toml`)
 - See `config.toml.example` and `.env.example` for templates
+- **`sync_local_sessions`** — global (`[defaults]`, bool, default `true`) and per-repo (`[repos.*]`, `Option<bool>`); controls local CLI session sync to Slack
 - **Tuning params** (`[tuning]`): `slack_max_message_chars`, `session_ttl_days`, `live_update_interval_secs`, `rate_limit_interval_ms`, `max_accumulated_text_bytes`, `first_chunk_max_retries`, `log_preview_max_len`
 
 ## Sensitive Files — Do Not Commit
 
 - `.env` — Slack tokens
 - `config.toml` — may contain tokens and repo paths
-- `sessions.json` — runtime session state
+- `sessions.db` — runtime session state (SQLite)
