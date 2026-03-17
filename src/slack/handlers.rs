@@ -16,6 +16,31 @@ use super::{AppState, FALLBACK_TITLE_MAX_LEN, SLACK_MAX_MESSAGE_CHARS, SLACK_UPD
 // All magic numbers are now configurable via config.tuning.
 // Defaults are defined in TuningConfig in config.rs.
 
+/// Flush accumulated text to Slack — either update the existing editable message,
+/// post a new editable message, or post as a permanent message if over the limit.
+/// Returns the (possibly updated) `status_ts`.
+async fn flush_to_slack(
+    state: &AppState,
+    channel_id: &str,
+    thread_ts: &str,
+    accumulated_text: &mut String,
+    status_ts: Option<String>,
+) -> Option<String> {
+    let display = truncate_text(accumulated_text, SLACK_UPDATE_MAX_CHARS);
+
+    if accumulated_text.len() > SLACK_UPDATE_MAX_CHARS {
+        // Outgrown the edit limit — post as permanent and start fresh.
+        post_thread_reply(state, channel_id, thread_ts, &display).await;
+        accumulated_text.clear();
+        None
+    } else if let Some(ref ts) = status_ts {
+        update_message(state, channel_id, ts, &display).await;
+        status_ts
+    } else {
+        post_thread_reply_with_ts(state, channel_id, thread_ts, &display).await
+    }
+}
+
 // ── Guards ─────────────────────────────────────────────────────────────
 
 /// RAII guard that removes a repo name from `pending_repos` on drop.
@@ -1042,20 +1067,14 @@ pub(crate) async fn process_events(
                             state.config.tuning.live_update_interval_secs,
                         )
                 {
-                    let display = truncate_text(&accumulated_text, SLACK_UPDATE_MAX_CHARS);
-
-                    // If the text has outgrown the chat.update limit, post the
-                    // current chunk as a permanent message and start fresh.
-                    if accumulated_text.len() > SLACK_UPDATE_MAX_CHARS {
-                        post_thread_reply(state, channel_id, thread_ts, &display).await;
-                        accumulated_text.clear();
-                        status_ts = None;
-                    } else if let Some(ref ts) = status_ts {
-                        update_message(state, channel_id, ts, &display).await;
-                    } else {
-                        status_ts =
-                            post_thread_reply_with_ts(state, channel_id, thread_ts, &display).await;
-                    }
+                    status_ts = flush_to_slack(
+                        state,
+                        channel_id,
+                        thread_ts,
+                        &mut accumulated_text,
+                        status_ts,
+                    )
+                    .await;
                     streamed = true;
                     last_update = std::time::Instant::now();
                 }
@@ -1109,20 +1128,14 @@ pub(crate) async fn process_events(
                         }
                         accumulated_text.push_str(&msg);
 
-                        let display = truncate_text(&accumulated_text, SLACK_UPDATE_MAX_CHARS);
-
-                        if accumulated_text.len() > SLACK_UPDATE_MAX_CHARS {
-                            // Outgrown the edit limit — post as permanent and start fresh.
-                            post_thread_reply(state, channel_id, thread_ts, &display).await;
-                            accumulated_text.clear();
-                            status_ts = None;
-                        } else if let Some(ref ts) = status_ts {
-                            update_message(state, channel_id, ts, &display).await;
-                        } else {
-                            status_ts =
-                                post_thread_reply_with_ts(state, channel_id, thread_ts, &display)
-                                    .await;
-                        }
+                        status_ts = flush_to_slack(
+                            state,
+                            channel_id,
+                            thread_ts,
+                            &mut accumulated_text,
+                            status_ts,
+                        )
+                        .await;
                         streamed = true;
                         last_update = std::time::Instant::now();
                     }
