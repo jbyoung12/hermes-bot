@@ -284,8 +284,7 @@ pub(crate) async fn handle_event_result(
                 } else {
                     format!("{}ms", duration_ms)
                 };
-                let hit_turn_limit =
-                    subtype == "max_turns_reached" || subtype == "error_max_turns";
+                let hit_turn_limit = subtype == "max_turns_reached" || subtype == "error_max_turns";
                 let footer = if hit_turn_limit {
                     format!(
                         "_:warning: Hit turn limit ({} turns, {})._ Reply in this thread to continue where Claude left off.",

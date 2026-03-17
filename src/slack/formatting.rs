@@ -323,10 +323,7 @@ pub(crate) fn format_tool_use(name: &str, input: &serde_json::Value) -> Option<S
             Some(format!(":mag: `WebSearch` \"{}\"", query))
         }
         "WebFetch" => {
-            let url = input
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("url");
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("url");
             Some(format!(":globe_with_meridians: `WebFetch` {}", url))
         }
         _ => None,
