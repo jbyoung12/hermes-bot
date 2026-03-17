@@ -251,6 +251,25 @@ pub(crate) async fn handle_event_result(
                 if let Some(ref ts) = config.status_ts {
                     delete_message(state, channel_id, ts).await;
                 }
+
+                // Post a stats footer. Tool calls were already posted live,
+                // so we only need turns/duration here.
+                let duration = if duration_ms >= 1000 {
+                    format!("{:.1}s", duration_ms as f64 / 1000.0)
+                } else {
+                    format!("{}ms", duration_ms)
+                };
+                let hit_turn_limit =
+                    subtype == "max_turns_reached" || subtype == "error_max_turns";
+                let footer = if hit_turn_limit {
+                    format!(
+                        "_:warning: Hit turn limit ({} turns, {})._ Reply in this thread to continue where Claude left off.",
+                        num_turns, duration
+                    )
+                } else {
+                    format!("_Turns: {} | Duration: {}_", num_turns, duration)
+                };
+                post_thread_reply(state, channel_id, thread_ts, &footer).await;
             }
 
             if !posted {
@@ -868,8 +887,8 @@ impl ToolUseSummary {
                     .get("file_path")
                     .and_then(|v| v.as_str())
                     .and_then(|p| {
-                        // Skip plan file writes from the summary
-                        if name == "Write" && p.contains(".claude/plans/") {
+                        // Skip plan file writes/edits from the summary
+                        if (name == "Write" || name == "Edit") && p.contains(".claude/plans/") {
                             return None;
                         }
                         // Extract basename
@@ -983,6 +1002,9 @@ pub(crate) async fn process_events(
     // Deferred plan: capture the latest plan content instead of posting inline.
     // Posted once at TurnComplete so repeated writes only show the final version.
     let mut latest_plan: Option<String> = None;
+    // Track plan file path when an Edit (not Write) targets a plan file,
+    // so we can read the full content from disk at TurnComplete.
+    let mut plan_edit_path: Option<String> = None;
 
     loop {
         let event = match handle.receiver.recv().await {
@@ -1069,18 +1091,41 @@ pub(crate) async fn process_events(
                     }
                 }
 
-                if live_mode && !accumulated_text.is_empty() {
-                    // Finalize accumulated text as a permanent message before
-                    // the tool runs, so it doesn't get overwritten later.
-                    let display = truncate_text(&accumulated_text, SLACK_UPDATE_MAX_CHARS);
-                    if let Some(ref ts) = status_ts {
-                        update_message(state, channel_id, ts, &display).await;
-                    } else {
-                        post_thread_reply(state, channel_id, thread_ts, &display).await;
+                // Detect Edit tool calls targeting plan files so we can read
+                // the full updated content from disk at TurnComplete.
+                if name == "Edit"
+                    && let Some(path) = input.get("file_path").and_then(|v| v.as_str())
+                    && path.contains(".claude/plans/")
+                {
+                    plan_edit_path = Some(path.to_string());
+                }
+
+                if live_mode {
+                    // Append tool call notifications to accumulated text,
+                    // using the same edit-message pattern as regular text.
+                    if let Some(msg) = formatting::format_tool_use(name, input) {
+                        if !accumulated_text.is_empty() {
+                            accumulated_text.push('\n');
+                        }
+                        accumulated_text.push_str(&msg);
+
+                        let display = truncate_text(&accumulated_text, SLACK_UPDATE_MAX_CHARS);
+
+                        if accumulated_text.len() > SLACK_UPDATE_MAX_CHARS {
+                            // Outgrown the edit limit — post as permanent and start fresh.
+                            post_thread_reply(state, channel_id, thread_ts, &display).await;
+                            accumulated_text.clear();
+                            status_ts = None;
+                        } else if let Some(ref ts) = status_ts {
+                            update_message(state, channel_id, ts, &display).await;
+                        } else {
+                            status_ts =
+                                post_thread_reply_with_ts(state, channel_id, thread_ts, &display)
+                                    .await;
+                        }
+                        streamed = true;
+                        last_update = std::time::Instant::now();
                     }
-                    accumulated_text.clear();
-                    status_ts = None;
-                    streamed = true;
                 }
             }
             AgentEvent::QuestionPending {
@@ -1188,6 +1233,38 @@ pub(crate) async fn process_events(
                 } else if let Some(ref ts) = status_ts {
                     // No remaining text but a status message exists — clean it up.
                     delete_message(state, channel_id, ts).await;
+                }
+
+                // If a plan file was edited (not written fresh), read the
+                // full updated content from disk so we can post it.
+                if latest_plan.is_none()
+                    && let Some(ref path) = plan_edit_path
+                {
+                    match tokio::fs::read_to_string(path).await {
+                        Ok(content) => {
+                            let max_size = state.config.tuning.max_accumulated_text_bytes;
+                            if let Err(e) = validate_plan_size(&content, max_size) {
+                                warn!("Edited plan validation failed: {}", e);
+                                post_thread_reply(
+                                    state,
+                                    channel_id,
+                                    thread_ts,
+                                    &format!("⚠️ {}", e),
+                                )
+                                .await;
+                            } else {
+                                state
+                                    .last_plan
+                                    .lock()
+                                    .await
+                                    .insert(thread_ts.to_string(), content.clone());
+                                latest_plan = Some(content);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to read edited plan file {}: {}", path, e);
+                        }
+                    }
                 }
 
                 // Post deferred plan if one was captured during this turn.

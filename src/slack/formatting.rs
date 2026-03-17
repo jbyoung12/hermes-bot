@@ -279,6 +279,60 @@ pub(crate) fn format_questions(questions: &serde_json::Value) -> String {
     lines.join("\n")
 }
 
+/// Format a tool use notification for live-streaming to Slack.
+/// Returns `Some(message)` for interesting tools (Edit, Write, Bash, Task,
+/// WebSearch, WebFetch) and `None` for noisy ones (Read, Grep, Glob, etc.).
+pub(crate) fn format_tool_use(name: &str, input: &serde_json::Value) -> Option<String> {
+    match name {
+        "Edit" | "Write" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("file");
+            // Skip plan file writes — those are posted separately.
+            if name == "Write" && path.contains(".claude/plans/") {
+                return None;
+            }
+            let basename = path.rsplit('/').next().unwrap_or(path);
+            Some(format!(":pencil2: `{}` {}", name, basename))
+        }
+        "Bash" => {
+            let cmd = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("command");
+            let truncated = if cmd.len() > 80 {
+                format!("{}...", &cmd[..77])
+            } else {
+                cmd.to_string()
+            };
+            Some(format!(":computer: `Bash` `{}`", truncated))
+        }
+        "Task" => {
+            let desc = input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("subagent");
+            Some(format!(":robot_face: `Task` {}", desc))
+        }
+        "WebSearch" => {
+            let query = input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("search");
+            Some(format!(":mag: `WebSearch` \"{}\"", query))
+        }
+        "WebFetch" => {
+            let url = input
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("url");
+            Some(format!(":globe_with_meridians: `WebFetch` {}", url))
+        }
+        _ => None,
+    }
+}
+
 /// Format a tool approval request for posting to Slack.
 pub(crate) fn format_tool_approval(tool_name: &str, tool_input: &serde_json::Value) -> String {
     let input_preview = if let Some(obj) = tool_input.as_object() {
