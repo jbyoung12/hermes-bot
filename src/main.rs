@@ -10,7 +10,7 @@ use crate::agent::Agent;
 use crate::agent::claude::ClaudeAgent;
 use crate::config::AgentKind;
 use crate::session::SessionStore;
-use crate::slack::AppState;
+use crate::slack::{AppState, SlackContext, SyncGuard, ThreadState};
 use slack_morphism::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -68,25 +68,40 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(config);
     let agents = Arc::new(agents);
 
+    // Build sub-structs.
+    let slack_ctx = Arc::new(SlackContext {
+        token: bot_token,
+        client: client.clone(),
+        bot_user_id,
+        repo_channels: tokio::sync::RwLock::new(repo_channels),
+        rate_limiter: Mutex::new(HashMap::new()),
+        seen_messages: Mutex::new(HashMap::new()),
+    });
+
+    let threads = Arc::new(ThreadState {
+        handles: Mutex::new(HashMap::new()),
+        kill_senders: Mutex::new(HashMap::new()),
+        plans: Mutex::new(HashMap::new()),
+        pending_answers: Mutex::new(HashMap::new()),
+        pending_approvals: Mutex::new(HashMap::new()),
+        models: Mutex::new(HashMap::new()),
+        in_progress: Mutex::new(HashSet::new()),
+        queued_messages: Mutex::new(HashMap::new()),
+    });
+
+    let sync_guard = Arc::new(SyncGuard {
+        pending_repos: Mutex::new(HashMap::new()),
+        pending_session_ids: Mutex::new(HashSet::new()),
+    });
+
     // Build shared state.
     let state = AppState {
         config: config.clone(),
         sessions,
         agents: agents.clone(),
-        bot_token: bot_token.clone(),
-        slack_client: client.clone(),
-        repo_channels: Arc::new(tokio::sync::RwLock::new(repo_channels)),
-        bot_user_id: Arc::new(bot_user_id),
-        in_progress: Arc::new(Mutex::new(HashSet::new())),
-        pending_repos: Arc::new(Mutex::new(HashMap::new())),
-        pending_session_ids: Arc::new(Mutex::new(HashSet::new())),
-        agent_handles: Arc::new(Mutex::new(HashMap::new())),
-        kill_senders: Arc::new(Mutex::new(HashMap::new())),
-        last_plan: Arc::new(Mutex::new(HashMap::new())),
-        pending_answers: Arc::new(Mutex::new(HashMap::new())),
-        pending_tool_approvals: Arc::new(Mutex::new(HashMap::new())),
-        rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-        thread_models: Arc::new(Mutex::new(HashMap::new())),
+        slack: slack_ctx,
+        threads,
+        sync: sync_guard,
     };
 
     // Spawn session sync (watch for local Claude Code sessions).
@@ -143,7 +158,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 tick_count += 1;
 
                 // Run cleanup every 60 seconds.
-                heartbeat_state.cleanup_stale_pending_repos().await;
+                heartbeat_state.sync.cleanup_stale().await;
 
                 // Prune expired sessions every 5 minutes (every 5 ticks).
                 if tick_count.is_multiple_of(5) {
@@ -154,8 +169,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let active = heartbeat_state.sessions.active_sessions().await.len();
-                let handles = heartbeat_state.agent_handles.lock().await.len();
-                let pending = heartbeat_state.pending_repos.lock().await.len();
+                let handles = heartbeat_state.threads.active_count().await;
+                let pending = heartbeat_state.sync.pending_repos.lock().await.len();
                 info!(
                     "Heartbeat: {} active session(s), {} running agent(s), {} pending repo(s)",
                     active, handles, pending
@@ -164,21 +179,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         } => {}
     }
 
-    // Kill all running agent processes.
-    let mut kill_senders = shutdown_state.kill_senders.lock().await;
-    let count = kill_senders.len();
-    for (thread_ts, kill_tx) in kill_senders.drain() {
-        let _ = kill_tx.send(());
-        info!("Killed agent for thread {}", thread_ts);
-    }
-    if count > 0 {
-        info!("Cleaned up {} agent process(es)", count);
-    }
-    shutdown_state.agent_handles.lock().await.clear();
-
-    // Clear cached plans and pending answers.
-    shutdown_state.last_plan.lock().await.clear();
-    shutdown_state.pending_answers.lock().await.clear();
+    // Graceful shutdown: kill all running agents and clear state.
+    shutdown_state.threads.shutdown().await;
 
     // Abort the sync task gracefully (it's an infinite loop, so we abort it).
     if let Some(sync_handle) = sync_handle {

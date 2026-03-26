@@ -189,8 +189,11 @@ pub async fn post_thread_reply_with_ts(
     thread_ts: &str,
     text: &str,
 ) -> Option<String> {
-    state.rate_limit(channel_id).await;
-    let session = state.slack_client.open_session(&state.bot_token);
+    state
+        .slack
+        .rate_limit(channel_id, state.config.tuning.rate_limit_interval_ms)
+        .await;
+    let session = state.slack.client.open_session(&state.slack.token);
     let req = SlackApiChatPostMessageRequest::new(
         SlackChannelId::new(channel_id.to_string()),
         SlackMessageContent::new().with_text(text.to_string()),
@@ -247,7 +250,7 @@ pub(crate) async fn post_thread_reply_result(
 /// * `ts` - Message timestamp (identifies the message to update)
 /// * `text` - New message text (Slack mrkdwn format)
 pub async fn update_message(state: &AppState, channel_id: &str, ts: &str, text: &str) {
-    let session = state.slack_client.open_session(&state.bot_token);
+    let session = state.slack.client.open_session(&state.slack.token);
     let req = SlackApiChatUpdateRequest::new(
         SlackChannelId::new(channel_id.to_string()),
         SlackMessageContent::new().with_text(text.to_string()),
@@ -260,7 +263,7 @@ pub async fn update_message(state: &AppState, channel_id: &str, ts: &str, text: 
 
 /// Delete a Slack message.
 pub(crate) async fn delete_message(state: &AppState, channel_id: &str, ts: &str) {
-    let session = state.slack_client.open_session(&state.bot_token);
+    let session = state.slack.client.open_session(&state.slack.token);
     let req = SlackApiChatDeleteRequest::new(
         SlackChannelId::new(channel_id.to_string()),
         SlackTs::new(ts.to_string()),
@@ -290,8 +293,11 @@ pub async fn post_channel_message(
     channel_id: &str,
     text: &str,
 ) -> Option<String> {
-    state.rate_limit(channel_id).await;
-    let session = state.slack_client.open_session(&state.bot_token);
+    state
+        .slack
+        .rate_limit(channel_id, state.config.tuning.rate_limit_interval_ms)
+        .await;
+    let session = state.slack.client.open_session(&state.slack.token);
     let req = SlackApiChatPostMessageRequest::new(
         SlackChannelId::new(channel_id.to_string()),
         SlackMessageContent::new().with_text(text.to_string()),
@@ -309,7 +315,7 @@ pub async fn post_channel_message(
 // ── Reactions ──────────────────────────────────────────────────────────
 
 pub(crate) async fn add_reaction(state: &AppState, channel_id: &str, ts: &str, emoji: &str) {
-    let session = state.slack_client.open_session(&state.bot_token);
+    let session = state.slack.client.open_session(&state.slack.token);
     let req = SlackApiReactionsAddRequest::new(
         SlackChannelId::new(channel_id.to_string()),
         SlackReactionName::new(emoji.to_string()),
@@ -321,7 +327,7 @@ pub(crate) async fn add_reaction(state: &AppState, channel_id: &str, ts: &str, e
 }
 
 pub(crate) async fn remove_reaction(state: &AppState, channel_id: &str, ts: &str, emoji: &str) {
-    let session = state.slack_client.open_session(&state.bot_token);
+    let session = state.slack.client.open_session(&state.slack.token);
     let req = SlackApiReactionsRemoveRequest::new(SlackReactionName::new(emoji.to_string()))
         .with_channel(SlackChannelId::new(channel_id.to_string()))
         .with_timestamp(SlackTs::new(ts.to_string()));

@@ -3,15 +3,17 @@ use crate::agent::{AgentEvent, AgentHandle};
 use crate::session::{SessionInfo, SessionStatus};
 use chrono::Utc;
 use slack_morphism::prelude::*;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use super::api::*;
 use super::formatting::{self, AgentResponse, format_questions, split_for_slack, truncate_text};
-use super::{AppState, FALLBACK_TITLE_MAX_LEN, SLACK_MAX_MESSAGE_CHARS, SLACK_UPDATE_MAX_CHARS};
+use super::{
+    AppState, FALLBACK_TITLE_MAX_LEN, QueuedMessage, SLACK_MAX_MESSAGE_CHARS,
+    SLACK_UPDATE_MAX_CHARS,
+};
 
 // All magic numbers are now configurable via config.tuning.
 // Defaults are defined in TuningConfig in config.rs.
@@ -50,7 +52,7 @@ async fn flush_to_slack(
 /// is held or poisoned. To handle this edge case, a background cleanup task runs
 /// every 60 seconds to remove repos that have been pending for >5 minutes.
 struct PendingRepoGuard {
-    pending_repos: Arc<Mutex<HashMap<String, Instant>>>,
+    sync: Arc<super::SyncGuard>,
     repo_name: String,
 }
 
@@ -105,7 +107,7 @@ impl Drop for PendingRepoGuard {
     fn drop(&mut self) {
         // Use try_lock since drop is sync — if the lock is poisoned/held,
         // the heartbeat or next startup will eventually clean up.
-        if let Ok(mut guard) = self.pending_repos.try_lock() {
+        if let Ok(mut guard) = self.sync.pending_repos.try_lock() {
             guard.remove(&self.repo_name);
         }
     }
@@ -160,15 +162,6 @@ fn agent_disconnected_message(recoverable: bool) -> &'static str {
 
 /// How to persist the session after a successful turn.
 pub(crate) enum SessionAction {
-    /// Create a new session (used by handle_new_message).
-    /// Fields that depend on the event result (session_id, total_turns) are
-    /// filled in by `handle_event_result`.
-    Insert {
-        repo: String,
-        repo_path: std::path::PathBuf,
-        agent_kind: crate::config::AgentKind,
-        model: Option<String>,
-    },
     /// Update an existing session. If `reset_status` is true, also set
     /// status back to Active (used by handle_execute_plan).
     Update { reset_status: bool },
@@ -196,11 +189,6 @@ pub(crate) async fn handle_event_result(
     config: EventResultConfig,
     session_action: SessionAction,
 ) {
-    // Take session_action into an Option so we can consume it in TurnComplete
-    // or fall through to persist it for early-exit cases.
-    let mut session_action = Some(session_action);
-    let handle_session_id = handle.session_id.clone();
-
     match result {
         EventResult::TurnComplete {
             result_text,
@@ -306,57 +294,32 @@ pub(crate) async fn handle_event_result(
             // Store the handle for future thread replies.
             handle.session_id = Some(session_id.clone());
             state
-                .agent_handles
+                .threads
+                .handles
                 .lock()
                 .await
                 .insert(thread_ts.to_string(), handle);
 
             // Persist session.
-            match session_action.take().unwrap() {
-                SessionAction::Insert {
-                    repo,
-                    repo_path,
-                    agent_kind,
-                    model,
-                } => {
-                    let session = SessionInfo {
-                        session_id,
-                        repo,
-                        repo_path,
-                        agent_kind,
-                        channel_id: channel_id.to_string(),
-                        thread_ts: thread_ts.to_string(),
-                        created_at: Utc::now(),
-                        last_active: Utc::now(),
-                        status: SessionStatus::Active,
-                        total_turns: num_turns,
-                        model,
-                    };
-                    if let Err(e) = state.sessions.insert(session).await {
-                        error!("Failed to store session: {}", e);
+            let SessionAction::Update { reset_status } = session_action;
+            let new_session_id = session_id;
+            if let Err(e) = state
+                .sessions
+                .update(thread_ts, move |s| {
+                    s.last_active = Utc::now();
+                    s.total_turns = num_turns;
+                    s.session_id = new_session_id.clone();
+                    if reset_status {
+                        s.status = SessionStatus::Active;
                     }
-                }
-                SessionAction::Update { reset_status } => {
-                    let new_session_id = session_id;
-                    if let Err(e) = state
-                        .sessions
-                        .update(thread_ts, move |s| {
-                            s.last_active = Utc::now();
-                            s.total_turns = num_turns;
-                            s.session_id = new_session_id.clone();
-                            if reset_status {
-                                s.status = SessionStatus::Active;
-                            }
-                        })
-                        .await
-                    {
-                        error!("Failed to update session: {}", e);
-                    }
-                }
+                })
+                .await
+            {
+                error!("Failed to update session: {}", e);
             }
         }
         EventResult::ProcessExited { code } => {
-            state.kill_senders.lock().await.remove(thread_ts);
+            state.threads.kill_senders.lock().await.remove(thread_ts);
             if let Some(ref title) = config.title {
                 update_message(state, channel_id, thread_ts, &format!("*{}*", title)).await;
             }
@@ -374,7 +337,13 @@ pub(crate) async fn handle_event_result(
         EventResult::ChannelClosed => {
             // If the kill sender was already removed, this was an intentional
             // kill (!stop or interrupted by a new message) — skip the message.
-            let was_unexpected = state.kill_senders.lock().await.remove(thread_ts).is_some();
+            let was_unexpected = state
+                .threads
+                .kill_senders
+                .lock()
+                .await
+                .remove(thread_ts)
+                .is_some();
             if was_unexpected {
                 if let Some(ref title) = config.title {
                     update_message(state, channel_id, thread_ts, &format!("*{}*", title)).await;
@@ -395,35 +364,7 @@ pub(crate) async fn handle_event_result(
         }
     }
 
-    // For early exits (ProcessExited / ChannelClosed on a new session), the
-    // session was never persisted. Insert it now so thread replies still work.
-    if let Some(SessionAction::Insert {
-        repo,
-        repo_path,
-        agent_kind,
-        model,
-    }) = session_action
-    {
-        let session_id = handle_session_id.unwrap_or_else(|| format!("pending-{}", thread_ts));
-        let session = SessionInfo {
-            session_id,
-            repo,
-            repo_path,
-            agent_kind,
-            channel_id: channel_id.to_string(),
-            thread_ts: thread_ts.to_string(),
-            created_at: Utc::now(),
-            last_active: Utc::now(),
-            status: SessionStatus::Active,
-            total_turns: 0,
-            model,
-        };
-        if let Err(e) = state.sessions.insert(session).await {
-            error!("Failed to store early session: {}", e);
-        }
-    }
-
-    // Clean up hourglass reaction and concurrency guard.
+    // Clean up hourglass reaction.
     remove_reaction(
         state,
         channel_id,
@@ -431,7 +372,6 @@ pub(crate) async fn handle_event_result(
         "hourglass_flowing_sand",
     )
     .await;
-    remove_in_progress(state, thread_ts).await;
 }
 
 /// Common cleanup when a new session fails to start: set fallback title
@@ -473,6 +413,7 @@ async fn run_agent_turn(
     // Store kill sender so !stop can reach it.
     if let Some(kill_tx) = handle.kill_tx.take() {
         state
+            .threads
             .kill_senders
             .lock()
             .await
@@ -515,7 +456,7 @@ pub(crate) async fn handle_new_message(
     user_id: String,
     text: String,
 ) {
-    let repo_name = match state.repo_for_channel(&channel_id).await {
+    let repo_name = match state.slack.repo_for_channel(&channel_id).await {
         Some(r) => r,
         None => {
             info!("Message in non-repo channel {}, ignoring", channel_id);
@@ -540,22 +481,28 @@ pub(crate) async fn handle_new_message(
     let system_prompt = state.config.defaults.append_system_prompt.clone();
     let model = repo_config.resolved_model(&state.config.defaults);
 
+    // If this repo already has an in-flight new session, skip to prevent
+    // duplicate threads from rapid channel messages.
+    {
+        let mut pending = state.sync.pending_repos.lock().await;
+        if pending.contains_key(&repo_name) {
+            info!(
+                "Repo '{}' already has an in-flight session, ignoring duplicate message",
+                repo_name
+            );
+            return;
+        }
+        pending.insert(repo_name.clone(), Instant::now());
+    }
+    let pending_guard = PendingRepoGuard {
+        sync: state.sync.clone(),
+        repo_name: repo_name.clone(),
+    };
+
     info!(
         "Starting {:?} session for repo '{}' (model: {})",
         repo_config.agent, repo_name, model
     );
-
-    // Mark repo as having an in-flight new session (prevents sync from duplicating).
-    // The guard ensures cleanup even if the spawned task panics.
-    state
-        .pending_repos
-        .lock()
-        .await
-        .insert(repo_name.clone(), Instant::now());
-    let pending_guard = PendingRepoGuard {
-        pending_repos: state.pending_repos.clone(),
-        repo_name: repo_name.clone(),
-    };
 
     // Acknowledge the user's original message with a reaction.
     add_reaction(&state, &channel_id, &message_ts, "eyes").await;
@@ -612,6 +559,34 @@ pub(crate) async fn handle_new_message(
             }
         };
 
+        // Insert the session now (before the first turn completes) so thread
+        // replies that arrive mid-turn can find it and queue.
+        let initial_session = SessionInfo {
+            session_id: format!("pending-{}", thread_ts_clone),
+            repo: repo_name.clone(),
+            repo_path: repo_path.clone(),
+            agent_kind: agent_kind.clone(),
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts_clone.clone(),
+            created_at: Utc::now(),
+            last_active: Utc::now(),
+            status: SessionStatus::Active,
+            total_turns: 0,
+            model: Some(model.clone()),
+        };
+        if let Err(e) = state_clone.sessions.insert(initial_session).await {
+            error!("Failed to store initial session: {}", e);
+        }
+
+        // Mark thread as in_progress so thread replies during the first
+        // turn are queued instead of spawning a duplicate agent.
+        state_clone
+            .threads
+            .in_progress
+            .lock()
+            .await
+            .insert(thread_ts_clone.clone());
+
         let title = fallback_title(&text);
 
         if !run_agent_turn(
@@ -629,11 +604,8 @@ pub(crate) async fn handle_new_message(
                 status_ts: None,
                 repo_name: repo_name.clone(),
             },
-            SessionAction::Insert {
-                repo: repo_name,
-                repo_path,
-                agent_kind,
-                model: Some(model),
+            SessionAction::Update {
+                reset_status: false,
             },
         )
         .await
@@ -647,6 +619,8 @@ pub(crate) async fn handle_new_message(
             )
             .await;
         }
+
+        remove_in_progress(&state_clone, &thread_ts_clone).await;
     });
 }
 
@@ -672,6 +646,10 @@ pub(crate) async fn handle_thread_reply(
         handle_execute_plan(state, channel_id, thread_ts, message_ts).await;
         return;
     }
+    if trimmed.eq_ignore_ascii_case("!session") {
+        handle_session_id(&state, &channel_id, &thread_ts).await;
+        return;
+    }
     if let Some(rest) = trimmed
         .strip_prefix("!model")
         .filter(|r| r.is_empty() || r.starts_with(' '))
@@ -681,13 +659,25 @@ pub(crate) async fn handle_thread_reply(
     }
 
     // Check if this thread is waiting for a question answer.
-    if let Some(answer_tx) = state.pending_answers.lock().await.remove(&thread_ts) {
+    if let Some(answer_tx) = state
+        .threads
+        .pending_answers
+        .lock()
+        .await
+        .remove(&thread_ts)
+    {
         let _ = answer_tx.send(text);
         return;
     }
 
     // Check if this thread is waiting for a tool approval.
-    if let Some(approval_tx) = state.pending_tool_approvals.lock().await.remove(&thread_ts) {
+    if let Some(approval_tx) = state
+        .threads
+        .pending_approvals
+        .lock()
+        .await
+        .remove(&thread_ts)
+    {
         let trimmed = text.trim().to_lowercase();
         let approved = matches!(trimmed.as_str(), "y" | "yes" | "allow" | "!allow");
         let _ = approval_tx.send(approved);
@@ -715,8 +705,8 @@ pub(crate) async fn handle_thread_reply(
 
     if session.status == SessionStatus::Error {
         // Clean up any stale handle for this thread.
-        state.agent_handles.lock().await.remove(&thread_ts);
-        state.last_plan.lock().await.remove(&thread_ts);
+        state.threads.handles.lock().await.remove(&thread_ts);
+        state.threads.plans.lock().await.remove(&thread_ts);
         post_thread_reply(
             &state,
             &channel_id,
@@ -727,36 +717,40 @@ pub(crate) async fn handle_thread_reply(
         return;
     }
 
-    // Concurrency guard — interrupt running agent if busy.
+    // Concurrency guard — queue message if agent is busy.
     {
-        let mut guard = state.in_progress.lock().await;
+        let guard = state.threads.in_progress.lock().await;
         if guard.contains(&thread_ts) {
-            // Kill the running agent so the new message takes over.
-            if let Some(kill_tx) = state.kill_senders.lock().await.remove(&thread_ts) {
-                let _ = kill_tx.send(());
-            }
-            state.agent_handles.lock().await.remove(&thread_ts);
-            info!("Interrupted running agent for thread {}", thread_ts);
+            drop(guard); // Release in_progress lock before acquiring queued_messages lock.
+            state
+                .threads
+                .queued_messages
+                .lock()
+                .await
+                .entry(thread_ts.clone())
+                .or_default()
+                .push(QueuedMessage {
+                    text,
+                    message_ts: message_ts.clone(),
+                });
+            add_reaction(&state, &channel_id, &message_ts, "speech_balloon").await;
+            info!("Queued message for busy thread {}", thread_ts);
+            return;
         }
-        guard.insert(thread_ts.clone());
+        // Note: we don't insert into in_progress here — the spawned task does it
+        // below after confirming we have a valid session and agent.
     }
 
     add_reaction(&state, &channel_id, &message_ts, "hourglass_flowing_sand").await;
 
     let repo_config = match state.config.repos.get(&session.repo) {
         Some(r) => r,
-        None => {
-            remove_in_progress(&state, &thread_ts).await;
-            return;
-        }
+        None => return,
     };
 
     let agent = match state.agents.get(&repo_config.agent) {
         Some(a) => a.clone(),
-        None => {
-            remove_in_progress(&state, &thread_ts).await;
-            return;
-        }
+        None => return,
     };
 
     let merged_tools = repo_config.merged_tools(&state.config.defaults);
@@ -768,101 +762,158 @@ pub(crate) async fn handle_thread_reply(
     let thread_ts_clone = thread_ts.clone();
 
     tokio::spawn(async move {
-        // Get existing handle or respawn with --resume.
-        let mut handle_opt = state_clone
-            .agent_handles
+        let mut prompt = text;
+        let mut hourglass_ts = message_ts;
+
+        // Mark thread as in_progress now that we're inside the spawned task.
+        state_clone
+            .threads
+            .in_progress
             .lock()
             .await
-            .remove(&thread_ts_clone);
+            .insert(thread_ts_clone.clone());
 
-        if handle_opt.is_none() {
-            info!(
-                "No agent handle for thread {}, respawning with --resume {}",
-                thread_ts_clone, session_id
-            );
-            match agent
-                .spawn(
-                    &repo_path,
-                    &merged_tools,
-                    system_prompt.as_deref(),
-                    Some(&session_id),
-                    None,
-                )
+        loop {
+            // Get existing handle or respawn with --resume.
+            let mut handle_opt = state_clone
+                .threads
+                .handles
+                .lock()
                 .await
-            {
-                Ok(h) => handle_opt = Some(h),
-                Err(e) => {
-                    error!(
-                        "Failed to respawn agent for thread {}: {}",
-                        thread_ts_clone, e
-                    );
-                    post_thread_reply(
-                        &state_clone,
-                        &channel_id,
-                        &thread_ts_clone,
-                        &format!("Agent error: {}", e),
+                .remove(&thread_ts_clone);
+
+            if handle_opt.is_none() {
+                // Look up the latest session_id (may have been updated by a previous turn).
+                let current_session_id = state_clone
+                    .sessions
+                    .get_by_thread(&thread_ts_clone)
+                    .await
+                    .map(|s| s.session_id.clone())
+                    .unwrap_or_else(|| session_id.clone());
+
+                info!(
+                    "No agent handle for thread {}, respawning with --resume {}",
+                    thread_ts_clone, current_session_id
+                );
+                match agent
+                    .spawn(
+                        &repo_path,
+                        &merged_tools,
+                        system_prompt.as_deref(),
+                        Some(&current_session_id),
+                        None,
                     )
-                    .await;
-                    if let Err(e) = state_clone
-                        .sessions
-                        .update(&thread_ts_clone, move |s| {
-                            s.status = SessionStatus::Error;
-                        })
-                        .await
-                    {
-                        error!("Failed to mark session as error: {}", e);
+                    .await
+                {
+                    Ok(h) => handle_opt = Some(h),
+                    Err(e) => {
+                        error!(
+                            "Failed to respawn agent for thread {}: {}",
+                            thread_ts_clone, e
+                        );
+                        post_thread_reply(
+                            &state_clone,
+                            &channel_id,
+                            &thread_ts_clone,
+                            &format!("Agent error: {}", e),
+                        )
+                        .await;
+                        if let Err(e) = state_clone
+                            .sessions
+                            .update(&thread_ts_clone, move |s| {
+                                s.status = SessionStatus::Error;
+                            })
+                            .await
+                        {
+                            error!("Failed to mark session as error: {}", e);
+                        }
+                        remove_reaction(
+                            &state_clone,
+                            &channel_id,
+                            &hourglass_ts,
+                            "hourglass_flowing_sand",
+                        )
+                        .await;
+                        remove_in_progress(&state_clone, &thread_ts_clone).await;
+                        return;
                     }
-                    remove_reaction(
-                        &state_clone,
-                        &channel_id,
-                        &message_ts,
-                        "hourglass_flowing_sand",
-                    )
-                    .await;
-                    remove_in_progress(&state_clone, &thread_ts_clone).await;
-                    return;
                 }
             }
-        }
 
-        let handle = handle_opt.unwrap();
+            let handle = handle_opt.unwrap();
 
-        if !run_agent_turn(
-            &state_clone,
-            &channel_id,
-            &thread_ts_clone,
-            handle,
-            &text,
-            "_Thinking..._",
-            EventResultConfig {
-                title: None,
-                recoverable: true,
-                retry_first_chunk: false,
-                hourglass_ts: message_ts.clone(),
-                status_ts: None,
-                repo_name,
-            },
-            SessionAction::Update {
-                reset_status: false,
-            },
-        )
-        .await
-        {
-            post_thread_reply(
+            if !run_agent_turn(
                 &state_clone,
                 &channel_id,
                 &thread_ts_clone,
-                "Failed to send message to agent.",
+                handle,
+                &prompt,
+                "_Thinking..._",
+                EventResultConfig {
+                    title: None,
+                    recoverable: true,
+                    retry_first_chunk: false,
+                    hourglass_ts: hourglass_ts.clone(),
+                    status_ts: None,
+                    repo_name: repo_name.clone(),
+                },
+                SessionAction::Update {
+                    reset_status: false,
+                },
             )
-            .await;
-            remove_reaction(
+            .await
+            {
+                post_thread_reply(
+                    &state_clone,
+                    &channel_id,
+                    &thread_ts_clone,
+                    "Failed to send message to agent.",
+                )
+                .await;
+                remove_reaction(
+                    &state_clone,
+                    &channel_id,
+                    &hourglass_ts,
+                    "hourglass_flowing_sand",
+                )
+                .await;
+                remove_in_progress(&state_clone, &thread_ts_clone).await;
+                return;
+            }
+
+            // Turn complete — check if messages were queued while we were busy.
+            let queued = state_clone
+                .threads
+                .queued_messages
+                .lock()
+                .await
+                .remove(&thread_ts_clone)
+                .unwrap_or_default();
+
+            if queued.is_empty() {
+                remove_in_progress(&state_clone, &thread_ts_clone).await;
+                break;
+            }
+
+            // Combine all queued messages into a single prompt.
+            prompt = queued
+                .iter()
+                .map(|q| q.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            hourglass_ts = queued.last().unwrap().message_ts.clone();
+            add_reaction(
                 &state_clone,
                 &channel_id,
-                &message_ts,
+                &hourglass_ts,
                 "hourglass_flowing_sand",
             )
             .await;
-            remove_in_progress(&state_clone, &thread_ts_clone).await;
+            info!(
+                "Processing {} queued message(s) for thread {}",
+                queued.len(),
+                thread_ts_clone
+            );
         }
     });
 }
@@ -1100,9 +1151,10 @@ pub(crate) async fn process_events(
                         // Defer posting — store the latest version to post at TurnComplete.
                         latest_plan = Some(content.to_string());
 
-                        // Always update last_plan for !execute command.
+                        // Always update plans for !execute command.
                         state
-                            .last_plan
+                            .threads
+                            .plans
                             .lock()
                             .await
                             .insert(thread_ts.to_string(), content.to_string());
@@ -1122,10 +1174,11 @@ pub(crate) async fn process_events(
                     // Append tool call notifications to accumulated text,
                     // using the same edit-message pattern as regular text.
                     if let Some(msg) = formatting::format_tool_use(name, input) {
-                        if !accumulated_text.is_empty() {
+                        if !accumulated_text.is_empty() && !accumulated_text.ends_with('\n') {
                             accumulated_text.push('\n');
                         }
                         accumulated_text.push_str(&msg);
+                        accumulated_text.push('\n');
 
                         status_ts = flush_to_slack(
                             state,
@@ -1151,6 +1204,7 @@ pub(crate) async fn process_events(
                 // Create a oneshot channel to receive the user's reply.
                 let (answer_tx, answer_rx) = oneshot::channel::<String>();
                 state
+                    .threads
                     .pending_answers
                     .lock()
                     .await
@@ -1164,7 +1218,12 @@ pub(crate) async fn process_events(
                 match answer_rx.await {
                     Ok(answer) => {
                         // Re-add to in_progress now that we're resuming.
-                        state.in_progress.lock().await.insert(thread_ts.to_string());
+                        state
+                            .threads
+                            .in_progress
+                            .lock()
+                            .await
+                            .insert(thread_ts.to_string());
 
                         // Send the control response to approve and inject the answer.
                         let resp = protocol::answer_question(&request_id, &questions, &answer);
@@ -1192,7 +1251,8 @@ pub(crate) async fn process_events(
                 // Create a oneshot channel to receive the user's approval/denial.
                 let (approval_tx, approval_rx) = oneshot::channel::<bool>();
                 state
-                    .pending_tool_approvals
+                    .threads
+                    .pending_approvals
                     .lock()
                     .await
                     .insert(thread_ts.to_string(), approval_tx);
@@ -1205,7 +1265,12 @@ pub(crate) async fn process_events(
                 match approval_rx.await {
                     Ok(approved) => {
                         // Re-add to in_progress now that we're resuming.
-                        state.in_progress.lock().await.insert(thread_ts.to_string());
+                        state
+                            .threads
+                            .in_progress
+                            .lock()
+                            .await
+                            .insert(thread_ts.to_string());
 
                         let resp = if approved {
                             protocol::approve_tool(&request_id)
@@ -1266,7 +1331,8 @@ pub(crate) async fn process_events(
                                 .await;
                             } else {
                                 state
-                                    .last_plan
+                                    .threads
+                                    .plans
                                     .lock()
                                     .await
                                     .insert(thread_ts.to_string(), content.clone());
@@ -1324,20 +1390,16 @@ pub(crate) async fn process_events(
 
 async fn handle_stop(state: &AppState, channel_id: &str, thread_ts: &str) {
     // Kill the agent process if running.
-    let killed = if let Some(kill_tx) = state.kill_senders.lock().await.remove(thread_ts) {
+    let killed = if let Some(kill_tx) = state.threads.kill_senders.lock().await.remove(thread_ts) {
         let _ = kill_tx.send(());
         true
     } else {
         false
     };
 
-    // Clean up handle, stored plan, pending answers/approvals, and thread model override.
-    state.agent_handles.lock().await.remove(thread_ts);
-    state.last_plan.lock().await.remove(thread_ts);
-    state.thread_models.lock().await.remove(thread_ts);
-    // Dropping the senders unblocks process_events → ChannelClosed.
-    state.pending_answers.lock().await.remove(thread_ts);
-    state.pending_tool_approvals.lock().await.remove(thread_ts);
+    // Clean up all thread state (handles, plans, models, pending answers/approvals).
+    // Note: kill_senders already removed above; cleanup removes it again (no-op).
+    state.threads.cleanup(thread_ts).await;
 
     if killed {
         post_thread_reply(state, channel_id, thread_ts, "Agent stopped.").await;
@@ -1361,7 +1423,7 @@ async fn handle_stop(state: &AppState, channel_id: &str, thread_ts: &str) {
 }
 
 async fn handle_status(state: &AppState, channel_id: &str, thread_ts: &str) {
-    let has_handle = state.agent_handles.lock().await.contains_key(thread_ts);
+    let has_handle = state.threads.handles.lock().await.contains_key(thread_ts);
 
     match state.sessions.get_by_thread(thread_ts).await {
         Some(session) => {
@@ -1383,6 +1445,23 @@ async fn handle_status(state: &AppState, channel_id: &str, thread_ts: &str) {
                 session.last_active.format("%Y-%m-%d %H:%M:%S UTC"),
             );
             post_thread_reply(state, channel_id, thread_ts, &status_text).await;
+        }
+        None => {
+            post_thread_reply(state, channel_id, thread_ts, "No session in this thread.").await;
+        }
+    }
+}
+
+async fn handle_session_id(state: &AppState, channel_id: &str, thread_ts: &str) {
+    match state.sessions.get_by_thread(thread_ts).await {
+        Some(session) => {
+            post_thread_reply(
+                state,
+                channel_id,
+                thread_ts,
+                &format!("`{}`", session.session_id),
+            )
+            .await;
         }
         None => {
             post_thread_reply(state, channel_id, thread_ts, "No session in this thread.").await;
@@ -1424,7 +1503,8 @@ async fn handle_model_command(state: &AppState, channel_id: &str, thread_ts: &st
     match resolve_model_alias(arg) {
         Some(model_id) => {
             state
-                .thread_models
+                .threads
+                .models
                 .lock()
                 .await
                 .insert(thread_ts.to_string(), model_id.clone());
@@ -1462,7 +1542,7 @@ async fn handle_execute_plan(
     message_ts: String,
 ) {
     // Retrieve stored plan content.
-    let plan_content = match state.last_plan.lock().await.remove(&thread_ts) {
+    let plan_content = match state.threads.plans.lock().await.remove(&thread_ts) {
         Some(plan) => plan,
         None => {
             post_thread_reply(
@@ -1502,26 +1582,32 @@ async fn handle_execute_plan(
     };
 
     // Kill existing agent if running.
-    if let Some(mut handle) = state.agent_handles.lock().await.remove(&thread_ts)
+    if let Some(mut handle) = state.threads.handles.lock().await.remove(&thread_ts)
         && let Some(kill_tx) = handle.kill_tx.take()
     {
         let _ = kill_tx.send(());
     }
 
     // Concurrency guard.
-    state.in_progress.lock().await.insert(thread_ts.clone());
+    state
+        .threads
+        .in_progress
+        .lock()
+        .await
+        .insert(thread_ts.clone());
     add_reaction(&state, &channel_id, &message_ts, "hourglass_flowing_sand").await;
 
     // Mark repo as pending so the session sync doesn't pick up the fresh
     // session file and duplicate it as a new channel message.
     let repo_name = session.repo.clone();
     state
+        .sync
         .pending_repos
         .lock()
         .await
         .insert(repo_name.clone(), Instant::now());
     let pending_guard = PendingRepoGuard {
-        pending_repos: state.pending_repos.clone(),
+        sync: state.sync.clone(),
         repo_name: repo_name.clone(),
     };
 
@@ -1603,13 +1689,14 @@ async fn handle_execute_plan(
                 "hourglass_flowing_sand",
             )
             .await;
-            remove_in_progress(&state_clone, &thread_ts_clone).await;
         }
+
+        remove_in_progress(&state_clone, &thread_ts_clone).await;
     });
 }
 
 pub(crate) async fn remove_in_progress(state: &AppState, thread_ts: &str) {
-    let mut guard = state.in_progress.lock().await;
+    let mut guard = state.threads.in_progress.lock().await;
     guard.remove(thread_ts);
 }
 
@@ -1640,7 +1727,12 @@ pub async fn handle_slash_command(
             }
             let mut lines = vec!["*Active Sessions*".to_string()];
             for s in &sessions {
-                let has_handle = state.agent_handles.lock().await.contains_key(&s.thread_ts);
+                let has_handle = state
+                    .threads
+                    .handles
+                    .lock()
+                    .await
+                    .contains_key(&s.thread_ts);
                 let process = if has_handle { "running" } else { "idle" };
                 lines.push(format!(
                     "- `{}` ({:?}) — {} turns, process: {}, last active {}",
@@ -1658,6 +1750,7 @@ pub async fn handle_slash_command(
                 "*Hermes — Claude Code via Slack*\n\n",
                 "Just type in a repo channel to start a session. Reply in the thread to continue.\n\n",
                 "*Thread commands:*\n",
+                "`!session` — show session ID\n",
                 "`!status` — show session info\n",
                 "`!stop` — stop the session\n",
                 "`!model` — show current model\n",

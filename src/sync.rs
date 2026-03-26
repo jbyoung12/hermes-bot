@@ -40,6 +40,8 @@ fn read_conversation(jsonl_path: &Path) -> ConversationData {
     let mut turns: Vec<ConversationTurn> = Vec::new();
     let mut current_prompt: Option<String> = None;
     let mut current_response_parts: Vec<String> = Vec::new();
+    // Track the last plan per turn (plans can be rewritten multiple times).
+    let mut current_plan: Option<String> = None;
 
     let file = match std::fs::File::open(jsonl_path) {
         Ok(f) => f,
@@ -67,6 +69,10 @@ fn read_conversation(jsonl_path: &Path) -> ConversationData {
                 if let Some(prompt) = is_human_message(&val) {
                     // Save previous turn if any.
                     if let Some(prev_prompt) = current_prompt.take() {
+                        // Append the last plan (if any) before finalizing.
+                        if let Some(plan) = current_plan.take() {
+                            current_response_parts.push(format!("*Plan*\n\n{}", plan));
+                        }
                         let response = if current_response_parts.is_empty() {
                             None
                         } else {
@@ -86,6 +92,10 @@ fn read_conversation(jsonl_path: &Path) -> ConversationData {
                 if let Some(text) = extract_assistant_text(&val) {
                     current_response_parts.push(text);
                 }
+                // Track the last plan Write per turn (overwrites previous drafts).
+                if let Some(plan) = extract_plan_content(&val) {
+                    current_plan = Some(plan);
+                }
             }
             _ => {}
         }
@@ -93,6 +103,9 @@ fn read_conversation(jsonl_path: &Path) -> ConversationData {
 
     // Save last turn.
     if let Some(prompt) = current_prompt {
+        if let Some(plan) = current_plan.take() {
+            current_response_parts.push(format!("*Plan*\n\n{}", plan));
+        }
         let response = if current_response_parts.is_empty() {
             None
         } else {
@@ -102,6 +115,66 @@ fn read_conversation(jsonl_path: &Path) -> ConversationData {
     }
 
     ConversationData { turns }
+}
+
+/// Check if a .jsonl session file is a sidechain (subagent) session.
+/// Reads up to the first 20 lines looking for the `isSidechain` field.
+fn is_sidechain_session(jsonl_path: &Path) -> bool {
+    let file = match std::fs::File::open(jsonl_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    for line in std::io::BufReader::new(file).lines().take(20) {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let val: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract plan content from Write tool_use blocks targeting `.claude/plans/`.
+/// Returns the content of the last matching Write block (plans can be rewritten).
+fn extract_plan_content(val: &serde_json::Value) -> Option<String> {
+    let content = val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())?;
+
+    let mut last_plan: Option<String> = None;
+
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+        if block.get("name").and_then(|n| n.as_str()) != Some("Write") {
+            continue;
+        }
+        let input = match block.get("input") {
+            Some(i) => i,
+            None => continue,
+        };
+        let file_path = match input.get("file_path").and_then(|p| p.as_str()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !file_path.contains(".claude/plans/") {
+            continue;
+        }
+        if let Some(plan_text) = input.get("content").and_then(|c| c.as_str()) {
+            last_plan = Some(plan_text.to_string());
+        }
+    }
+
+    last_plan
 }
 
 /// Extract text content from an assistant message entry.
@@ -136,6 +209,15 @@ fn session_id_from_path(path: &Path) -> Option<String> {
     path.file_stem().map(|s| s.to_string_lossy().to_string())
 }
 
+/// Per-session sync state: what we've already posted to Slack.
+struct SyncState {
+    thread_ts: String,
+    completed_turns: usize,
+    /// Byte length of the last completed turn's response when we posted it.
+    /// Used to detect when a turn's response grows (e.g. plan → execution).
+    last_response_len: usize,
+}
+
 struct RepoSyncInfo {
     repo_name: String,
     project_dir: PathBuf,
@@ -157,7 +239,7 @@ pub async fn sync_sessions(state: AppState) {
     let claude_projects_dir = home.join(".claude").join("projects");
 
     // Build per-repo sync info.
-    let repo_channels = state.repo_channels.read().await;
+    let repo_channels = state.slack.repo_channels.read().await;
     let mut repos: Vec<RepoSyncInfo> = Vec::new();
 
     for (repo_name, repo_config) in &state.config.repos {
@@ -207,9 +289,8 @@ pub async fn sync_sessions(state: AppState) {
         .map(|(i, r)| (r.project_dir.clone(), i))
         .collect();
 
-    // Track how many completed turns have been posted per synced session.
-    // Key: session_id, Value: (thread_ts, completed_turn_count).
-    let mut synced_turns: HashMap<String, (String, usize)> = HashMap::new();
+    // Track sync state per session so we can detect new turns and response growth.
+    let mut synced_turns: HashMap<String, SyncState> = HashMap::new();
 
     // Set up filesystem watcher.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(100);
@@ -281,6 +362,12 @@ pub async fn sync_sessions(state: AppState) {
                 continue;
             }
 
+            // Skip sidechain (subagent) sessions.
+            if is_sidechain_session(&path) {
+                debug!("Skipping sidechain session '{}'", session_id);
+                continue;
+            }
+
             // Skip sessions already persisted from a prior run.
             if state.sessions.has_session_id(&session_id).await {
                 debug!(
@@ -298,7 +385,7 @@ pub async fn sync_sessions(state: AppState) {
             }
 
             sync_session(&state, repo, &session_id, &mut synced_turns).await;
-            state.release_claimed_session(&session_id).await;
+            state.sync.release(&session_id).await;
         }
     }
 
@@ -339,17 +426,28 @@ pub async fn sync_sessions(state: AppState) {
                 None => continue,
             };
 
-            // Already syncing this session — check for new turns.
-            if let Some((thread_ts, prev_count)) = synced_turns.get(&session_id).cloned() {
+            // Already syncing this session — check for new/updated turns.
+            if let Some(prev_state) = synced_turns.get(&session_id) {
+                let thread_ts = prev_state.thread_ts.clone();
+                let prev_turns = prev_state.completed_turns;
+                let prev_resp_len = prev_state.last_response_len;
                 sync_new_turns(
                     &state,
                     repo,
                     &session_id,
                     &thread_ts,
-                    prev_count,
+                    prev_turns,
+                    prev_resp_len,
                     &mut synced_turns,
                 )
                 .await;
+                continue;
+            }
+
+            // Skip sidechain (subagent) sessions.
+            let jsonl_path = repo.project_dir.join(format!("{}.jsonl", &session_id));
+            if is_sidechain_session(&jsonl_path) {
+                debug!("Skipping sidechain session '{}'", session_id);
                 continue;
             }
 
@@ -369,7 +467,7 @@ pub async fn sync_sessions(state: AppState) {
             sync_session(&state, repo, &session_id, &mut synced_turns).await;
 
             // Release the claim after sync completes (session is now persisted).
-            state.release_claimed_session(&session_id).await;
+            state.sync.release(&session_id).await;
         }
     }
 }
@@ -434,7 +532,7 @@ async fn sync_session(
     state: &AppState,
     repo: &RepoSyncInfo,
     session_id: &str,
-    synced_turns: &mut HashMap<String, (String, usize)>,
+    synced_turns: &mut HashMap<String, SyncState>,
 ) {
     let jsonl_path = repo.project_dir.join(format!("{}.jsonl", session_id));
     let conversation = match tokio::task::spawn_blocking({
@@ -501,18 +599,32 @@ async fn sync_session(
         }
     }
 
-    // Record turn count so the file watcher picks up future turns.
-    synced_turns.insert(session_id.to_string(), (thread_ts, completed_count));
+    // Record sync state so the file watcher picks up future changes.
+    let last_response_len = turns
+        .iter()
+        .rev()
+        .find_map(|t| t.response.as_ref().map(|r| r.len()))
+        .unwrap_or(0);
+    synced_turns.insert(
+        session_id.to_string(),
+        SyncState {
+            thread_ts,
+            completed_turns: completed_count,
+            last_response_len,
+        },
+    );
 }
 
-/// Re-read a synced session's .jsonl file and post any new completed turns to Slack.
+/// Re-read a synced session's .jsonl file and post any new completed turns
+/// (or response growth within the last turn) to Slack.
 async fn sync_new_turns(
     state: &AppState,
     repo: &RepoSyncInfo,
     session_id: &str,
     thread_ts: &str,
     prev_count: usize,
-    synced_turns: &mut HashMap<String, (String, usize)>,
+    prev_resp_len: usize,
+    synced_turns: &mut HashMap<String, SyncState>,
 ) {
     let jsonl_path = repo.project_dir.join(format!("{}.jsonl", session_id));
     let conversation = match tokio::task::spawn_blocking({
@@ -537,14 +649,24 @@ async fn sync_new_turns(
         .filter(|t| t.response.is_some())
         .count();
 
-    if completed_count <= prev_count {
+    // Check if the last completed turn's response has grown (e.g. plan → execution
+    // within the same turn, where no new human message separates them).
+    let last_resp_len = conversation
+        .turns
+        .iter()
+        .rev()
+        .find_map(|t| t.response.as_ref().map(|r| r.len()))
+        .unwrap_or(0);
+    let response_grew = completed_count == prev_count && last_resp_len > prev_resp_len;
+
+    if completed_count <= prev_count && !response_grew {
         return;
     }
 
     // If a Slack-driven turn is active on this thread, just update the counter
     // to stay in sync (the Slack handler will post the response).
     {
-        let in_prog = state.in_progress.lock().await;
+        let in_prog = state.threads.in_progress.lock().await;
         if in_prog.contains(thread_ts) {
             debug!(
                 "sync_new_turns '{}': thread {} is in_progress, updating counter only",
@@ -552,56 +674,96 @@ async fn sync_new_turns(
             );
             synced_turns.insert(
                 session_id.to_string(),
-                (thread_ts.to_string(), completed_count),
+                SyncState {
+                    thread_ts: thread_ts.to_string(),
+                    completed_turns: completed_count,
+                    last_response_len: last_resp_len,
+                },
             );
             return;
         }
     }
 
-    // Post new completed turns that haven't been synced yet.
-    let mut completed_seen = 0;
     let mut posted = 0;
-    for turn in &conversation.turns {
-        if turn.response.is_none() {
-            continue;
-        }
-        completed_seen += 1;
-        if completed_seen <= prev_count {
-            continue;
-        }
 
-        // Post the follow-up prompt.
-        let prompt_chunks =
-            crate::slack::split_for_slack(&turn.prompt, crate::slack::SLACK_MAX_MESSAGE_CHARS);
-        for (pi, chunk) in prompt_chunks.iter().enumerate() {
-            let msg = if pi == 0 {
-                format!("*>* {}", chunk)
-            } else {
-                chunk.clone()
-            };
-            crate::slack::post_thread_reply(state, &repo.channel_id, thread_ts, &msg).await;
+    if response_grew {
+        // The last completed turn's response grew — post the new content.
+        // Find the last completed turn and extract the delta.
+        if let Some(turn) = conversation
+            .turns
+            .iter()
+            .rev()
+            .find(|t| t.response.is_some())
+        {
+            let response = turn.response.as_ref().unwrap();
+            // Post only the new portion (text added since last sync).
+            let delta = &response[prev_resp_len..];
+            let trimmed = delta.trim_start_matches("\n\n").trim();
+            if !trimmed.is_empty() {
+                let chunks =
+                    crate::slack::split_for_slack(trimmed, crate::slack::SLACK_MAX_MESSAGE_CHARS);
+                for chunk in &chunks {
+                    crate::slack::post_thread_reply(state, &repo.channel_id, thread_ts, chunk)
+                        .await;
+                }
+                posted += 1;
+                debug!(
+                    "sync_new_turns '{}': posted response delta ({} → {} bytes)",
+                    session_id, prev_resp_len, last_resp_len
+                );
+            }
         }
+    }
 
-        let response = turn.response.as_ref().unwrap();
-        let response_chunks =
-            crate::slack::split_for_slack(response, crate::slack::SLACK_MAX_MESSAGE_CHARS);
-        for chunk in &response_chunks {
-            crate::slack::post_thread_reply(state, &repo.channel_id, thread_ts, chunk).await;
+    // Post new completed turns that haven't been synced yet.
+    if completed_count > prev_count {
+        let mut completed_seen = 0;
+        for turn in &conversation.turns {
+            if turn.response.is_none() {
+                continue;
+            }
+            completed_seen += 1;
+            if completed_seen <= prev_count {
+                continue;
+            }
+
+            // Post the follow-up prompt.
+            let prompt_chunks =
+                crate::slack::split_for_slack(&turn.prompt, crate::slack::SLACK_MAX_MESSAGE_CHARS);
+            for (pi, chunk) in prompt_chunks.iter().enumerate() {
+                let msg = if pi == 0 {
+                    format!("*>* {}", chunk)
+                } else {
+                    chunk.clone()
+                };
+                crate::slack::post_thread_reply(state, &repo.channel_id, thread_ts, &msg).await;
+            }
+
+            let response = turn.response.as_ref().unwrap();
+            let response_chunks =
+                crate::slack::split_for_slack(response, crate::slack::SLACK_MAX_MESSAGE_CHARS);
+            for chunk in &response_chunks {
+                crate::slack::post_thread_reply(state, &repo.channel_id, thread_ts, chunk).await;
+            }
+
+            posted += 1;
         }
-
-        posted += 1;
     }
 
     if posted > 0 {
         info!(
-            "Synced {} new turn(s) for session '{}' (total: {})",
+            "Synced {} update(s) for session '{}' (turns: {})",
             posted, session_id, completed_count
         );
     }
 
     synced_turns.insert(
         session_id.to_string(),
-        (thread_ts.to_string(), completed_count),
+        SyncState {
+            thread_ts: thread_ts.to_string(),
+            completed_turns: completed_count,
+            last_response_len: last_resp_len,
+        },
     );
 }
 
@@ -782,5 +944,112 @@ mod tests {
     fn test_read_conversation_nonexistent_file() {
         let conv = read_conversation(Path::new("/tmp/hermes_nonexistent_file.jsonl"));
         assert!(conv.turns.is_empty());
+    }
+
+    #[test]
+    fn test_is_sidechain_session_false() {
+        let dir = std::env::temp_dir().join("hermes_test_sidechain");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("normal_session.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","isSidechain":false,"message":{{"role":"user","content":"hello"}}}}"#
+        )
+        .unwrap();
+
+        assert!(!is_sidechain_session(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_is_sidechain_session_true() {
+        let dir = std::env::temp_dir().join("hermes_test_sidechain");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sidechain_session.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","isSidechain":true,"message":{{"role":"user","content":"subagent task"}}}}"#
+        )
+        .unwrap();
+
+        assert!(is_sidechain_session(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_extract_plan_content() {
+        let val = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    { "type": "text", "text": "Let me write a plan." },
+                    {
+                        "type": "tool_use",
+                        "id": "1",
+                        "name": "Write",
+                        "input": {
+                            "file_path": "/home/user/.claude/plans/my-plan.md",
+                            "content": "# Plan\n\n1. Do the thing\n2. Test it"
+                        }
+                    }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_plan_content(&val),
+            Some("# Plan\n\n1. Do the thing\n2. Test it".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_plan_content_no_plan() {
+        let val = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "1",
+                        "name": "Write",
+                        "input": {
+                            "file_path": "/home/user/project/src/main.rs",
+                            "content": "fn main() {}"
+                        }
+                    }
+                ]
+            }
+        });
+        assert_eq!(extract_plan_content(&val), None);
+    }
+
+    #[test]
+    fn test_read_conversation_with_plan() {
+        let dir = std::env::temp_dir().join("hermes_test_read_conv");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_plan.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"make a plan"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"1","name":"Write","input":{{"file_path":"/home/user/.claude/plans/plan.md","content":"Step 1\nStep 2"}}}}]}}}}"#
+        )
+        .unwrap();
+
+        let conv = read_conversation(&path);
+        assert_eq!(conv.turns.len(), 1);
+        let response = conv.turns[0].response.as_deref().unwrap();
+        assert!(response.contains("*Plan*"));
+        assert!(response.contains("Step 1\nStep 2"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -25,52 +25,19 @@ pub(crate) const SLACK_UPDATE_MAX_CHARS: usize = 3_900;
 /// Max length of the fallback title (truncated at word boundary).
 const FALLBACK_TITLE_MAX_LEN: usize = 80;
 
-/// Shared application state passed to all handlers.
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Arc<Config>,
-    pub sessions: crate::session::SessionStore,
-    pub agents: Arc<HashMap<AgentKind, Arc<dyn Agent>>>,
-    pub bot_token: SlackApiToken,
-    pub slack_client: Arc<SlackHyperClient>,
-    /// Repo name → channel ID mapping (populated on startup).
-    pub repo_channels: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
-    /// Bot's own user ID (to filter self-messages).
-    pub bot_user_id: Arc<String>,
-    /// Concurrency guard: set of thread_ts currently being processed.
-    pub in_progress: Arc<Mutex<HashSet<String>>>,
-    /// Repos with in-flight new message processing (prevents sync from duplicating threads).
-    /// Tracks repo name → timestamp when marked pending for cleanup.
-    pub pending_repos: Arc<Mutex<HashMap<String, Instant>>>,
-    /// Session IDs currently being claimed (not yet persisted to SessionStore).
-    /// Prevents race between sync and handle_new_message where both try to claim the same session.
-    pub pending_session_ids: Arc<Mutex<HashSet<String>>>,
-    /// Running agent processes: thread_ts → AgentHandle.
-    pub agent_handles: Arc<Mutex<HashMap<String, AgentHandle>>>,
-    /// Kill senders: thread_ts → oneshot kill signal.
-    /// Stored separately so `!stop` can always reach the kill signal
-    /// even when the handle is borrowed by a running task.
-    pub kill_senders: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    /// Last detected plan content per thread: thread_ts → plan text.
-    pub last_plan: Arc<Mutex<HashMap<String, String>>>,
-    /// Pending question answers: thread_ts → oneshot sender for the user's reply.
-    pub pending_answers: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
-    /// Pending tool approvals: thread_ts → oneshot sender for the user's allow/deny.
-    pub pending_tool_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
-    /// Per-channel rate limiter: channel_id → last write time.
-    pub rate_limiter: Arc<Mutex<HashMap<String, Instant>>>,
-    /// Per-thread model overrides from `/model` command: thread_ts → model ID.
-    pub thread_models: Arc<Mutex<HashMap<String, String>>>,
+// ── Sub-structs ───────────────────────────────────────────────────────
+
+/// Slack API connectivity, identity, channel mapping, rate limiting, and event dedup.
+pub struct SlackContext {
+    pub token: SlackApiToken,
+    pub client: Arc<SlackHyperClient>,
+    pub bot_user_id: String,
+    pub repo_channels: tokio::sync::RwLock<HashMap<String, String>>,
+    pub(crate) rate_limiter: Mutex<HashMap<String, Instant>>,
+    pub(crate) seen_messages: Mutex<HashMap<String, Instant>>,
 }
 
-impl AppState {
-    pub fn is_allowed_user(&self, user_id: &str) -> bool {
-        self.config
-            .slack
-            .allowed_users
-            .contains(&user_id.to_string())
-    }
-
+impl SlackContext {
     /// Look up which repo a channel belongs to.
     pub async fn repo_for_channel(&self, channel_id: &str) -> Option<String> {
         let channels = self.repo_channels.read().await;
@@ -80,41 +47,121 @@ impl AppState {
             .map(|(name, _)| name.clone())
     }
 
-    /// Atomically claim a new session for sync if:
-    /// 1. The session_id is not already owned by Hermes (in SessionStore or pending)
-    /// 2. The repo doesn't have an in-flight new message
-    ///
-    /// Returns true if the claim succeeded, false if already claimed.
-    /// On success, the session_id is added to pending_session_ids (caller must remove it later).
-    pub async fn try_claim_session_for_sync(&self, repo_name: &str, session_id: &str) -> bool {
-        // First check if session already exists (read-only, no lock held).
-        if self.sessions.has_session_id(session_id).await {
-            return false;
+    /// Deduplicate a message event. Returns `true` if this is a duplicate.
+    pub async fn is_duplicate(&self, message_ts: &str) -> bool {
+        let mut seen = self.seen_messages.lock().await;
+        if seen.contains_key(message_ts) {
+            return true;
         }
+        seen.insert(message_ts.to_string(), Instant::now());
+        // Prune entries older than 5 minutes to prevent unbounded growth.
+        if seen.len() > 100 {
+            let cutoff = std::time::Duration::from_secs(5 * 60);
+            seen.retain(|_, ts| ts.elapsed() < cutoff);
+        }
+        false
+    }
 
-        // Now atomically check and claim using both locks together to prevent TOCTOU.
-        // We need both locks to ensure atomicity.
+    /// Wait if needed to respect Slack's per-channel rate limit before posting.
+    pub async fn rate_limit(&self, channel_id: &str, interval_ms: u64) {
+        let min_interval = std::time::Duration::from_millis(interval_ms);
+        let mut limiter = self.rate_limiter.lock().await;
+        if let Some(last) = limiter.get(channel_id) {
+            let elapsed = last.elapsed();
+            if elapsed < min_interval {
+                let wait = min_interval - elapsed;
+                drop(limiter); // Release lock while sleeping.
+                tokio::time::sleep(wait).await;
+                limiter = self.rate_limiter.lock().await;
+            }
+        }
+        limiter.insert(channel_id.to_string(), Instant::now());
+    }
+}
+
+/// A message queued while the agent is busy processing a turn.
+pub struct QueuedMessage {
+    pub text: String,
+    pub message_ts: String,
+}
+
+/// Per-thread runtime state (all keyed by `thread_ts`).
+pub struct ThreadState {
+    pub handles: Mutex<HashMap<String, AgentHandle>>,
+    pub kill_senders: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    pub plans: Mutex<HashMap<String, String>>,
+    pub pending_answers: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    pub pending_approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    pub models: Mutex<HashMap<String, String>>,
+    pub in_progress: Mutex<HashSet<String>>,
+    pub queued_messages: Mutex<HashMap<String, Vec<QueuedMessage>>>,
+}
+
+impl ThreadState {
+    /// Remove all state for a thread (handles, kill_senders, plans, models,
+    /// pending_answers, pending_approvals, queued_messages). Does NOT touch `in_progress`.
+    pub async fn cleanup(&self, thread_ts: &str) {
+        self.handles.lock().await.remove(thread_ts);
+        self.kill_senders.lock().await.remove(thread_ts);
+        self.plans.lock().await.remove(thread_ts);
+        self.models.lock().await.remove(thread_ts);
+        self.queued_messages.lock().await.remove(thread_ts);
+        // Dropping the senders unblocks process_events → ChannelClosed.
+        self.pending_answers.lock().await.remove(thread_ts);
+        self.pending_approvals.lock().await.remove(thread_ts);
+    }
+
+    /// Drain kill_senders (sending kill signals), clear handles/plans/pending_answers.
+    pub async fn shutdown(&self) {
+        let mut kill_senders = self.kill_senders.lock().await;
+        let count = kill_senders.len();
+        for (thread_ts, kill_tx) in kill_senders.drain() {
+            let _ = kill_tx.send(());
+            info!("Killed agent for thread {}", thread_ts);
+        }
+        if count > 0 {
+            info!("Cleaned up {} agent process(es)", count);
+        }
+        self.handles.lock().await.clear();
+        self.plans.lock().await.clear();
+        self.pending_answers.lock().await.clear();
+        self.queued_messages.lock().await.clear();
+    }
+
+    /// Returns the number of active agent handles.
+    pub async fn active_count(&self) -> usize {
+        self.handles.lock().await.len()
+    }
+}
+
+/// Sync coordination guards for local CLI session sync.
+pub struct SyncGuard {
+    pub pending_repos: Mutex<HashMap<String, Instant>>,
+    pub pending_session_ids: Mutex<HashSet<String>>,
+}
+
+impl SyncGuard {
+    /// Atomically check both maps; inserts session_id if available.
+    /// Returns `true` if the claim succeeded.
+    pub async fn try_claim(&self, repo_name: &str, session_id: &str) -> bool {
         let pending_repos = self.pending_repos.lock().await;
         let mut pending_sessions = self.pending_session_ids.lock().await;
 
-        // Check if repo is pending or session is pending.
         if pending_repos.contains_key(repo_name) || pending_sessions.contains(session_id) {
             return false;
         }
 
-        // Both checks passed — claim the session.
         pending_sessions.insert(session_id.to_string());
         true
     }
 
-    /// Release a claimed session ID (called after session is persisted to SessionStore).
-    pub async fn release_claimed_session(&self, session_id: &str) {
+    /// Remove a session ID from pending_session_ids.
+    pub async fn release(&self, session_id: &str) {
         self.pending_session_ids.lock().await.remove(session_id);
     }
 
-    /// Clean up repos that have been pending for too long (>5 minutes).
-    /// This handles cases where PendingRepoGuard drop fails silently.
-    pub async fn cleanup_stale_pending_repos(&self) {
+    /// Remove repos that have been pending for >5 minutes.
+    pub async fn cleanup_stale(&self) {
         const MAX_PENDING_DURATION: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
         let mut pending = self.pending_repos.lock().await;
@@ -136,6 +183,44 @@ impl AppState {
             info!("Cleaned up {} stale pending repo(s)", cleaned);
         }
     }
+}
+
+// ── AppState ──────────────────────────────────────────────────────────
+
+/// Shared application state passed to all handlers.
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub agents: Arc<HashMap<AgentKind, Arc<dyn Agent>>>,
+    pub sessions: crate::session::SessionStore,
+    pub slack: Arc<SlackContext>,
+    pub threads: Arc<ThreadState>,
+    pub sync: Arc<SyncGuard>,
+}
+
+impl AppState {
+    pub fn is_allowed_user(&self, user_id: &str) -> bool {
+        self.config
+            .slack
+            .allowed_users
+            .contains(&user_id.to_string())
+    }
+
+    /// Atomically claim a new session for sync if:
+    /// 1. The session_id is not already owned by Hermes (in SessionStore or pending)
+    /// 2. The repo doesn't have an in-flight new message
+    ///
+    /// Returns true if the claim succeeded, false if already claimed.
+    /// On success, the session_id is added to pending_session_ids (caller must remove it later).
+    pub async fn try_claim_session_for_sync(&self, repo_name: &str, session_id: &str) -> bool {
+        // First check if session already exists (read-only, no lock held).
+        if self.sessions.has_session_id(session_id).await {
+            return false;
+        }
+
+        // Delegate to SyncGuard for the atomic check.
+        self.sync.try_claim(repo_name, session_id).await
+    }
 
     /// Whether we're in "live" streaming mode (edit messages in real-time).
     pub fn is_live_mode(&self) -> bool {
@@ -145,7 +230,7 @@ impl AppState {
     /// Resolve the model for a thread: thread override > repo config > global default.
     pub async fn resolved_model(&self, repo_name: &str, thread_ts: Option<&str>) -> String {
         if let Some(ts) = thread_ts
-            && let Some(m) = self.thread_models.lock().await.get(ts)
+            && let Some(m) = self.threads.models.lock().await.get(ts)
         {
             return m.clone();
         }
@@ -153,23 +238,6 @@ impl AppState {
             Some(repo) => repo.resolved_model(&self.config.defaults),
             None => crate::config::DEFAULT_MODEL.to_string(),
         }
-    }
-
-    /// Wait if needed to respect Slack's per-channel rate limit before posting.
-    pub(crate) async fn rate_limit(&self, channel_id: &str) {
-        let min_interval =
-            std::time::Duration::from_millis(self.config.tuning.rate_limit_interval_ms);
-        let mut limiter = self.rate_limiter.lock().await;
-        if let Some(last) = limiter.get(channel_id) {
-            let elapsed = last.elapsed();
-            if elapsed < min_interval {
-                let wait = min_interval - elapsed;
-                drop(limiter); // Release lock while sleeping.
-                tokio::time::sleep(wait).await;
-                limiter = self.rate_limiter.lock().await;
-            }
-        }
-        limiter.insert(channel_id.to_string(), Instant::now());
     }
 }
 
@@ -186,7 +254,7 @@ pub async fn handle_message(state: AppState, event: SlackMessageEvent) {
     };
 
     // Ignore bot's own messages.
-    if user_id == state.bot_user_id.as_str() {
+    if user_id == state.slack.bot_user_id {
         return;
     }
 
@@ -221,6 +289,12 @@ pub async fn handle_message(state: AppState, event: SlackMessageEvent) {
     };
 
     let message_ts = event.origin.ts.to_string();
+
+    // Deduplicate: Socket Mode can redeliver the same event if ack is slow.
+    if state.slack.is_duplicate(&message_ts).await {
+        info!("Ignoring duplicate event for message {}", message_ts);
+        return;
+    }
 
     // Determine if this is a thread reply or a new top-level message.
     if let Some(thread_ts) = event.origin.thread_ts.as_ref() {
